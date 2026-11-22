@@ -1,37 +1,39 @@
-name: Build Boards
+name: Build Otto Robot Firmware
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
 
 permissions:
   contents: read
 
 jobs:
-  build_otto:
-    name: Build otto-robot
+  build-otto-robot:
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:release-v6.1
+      image: espressif/idf:v6.1
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
-      - name: Build otto-robot
+      - name: Build otto-robot and merge binary
+        shell: bash  # 关键修复：强制使用 bash 环境
+        run: |
+          . $IDF_PATH/export.sh  # 关键修复：用 POSIX 的 '.' 替代 'source'
+          python scripts/build.py otto-robot
+
+      - name: Rename merged binary for easy identification
         shell: bash
         run: |
-          source "$IDF_PATH/export.sh"
-          cd xiaozhi-esp32
-          rm -f sdkconfig sdkconfig.old
-          rm -rf build
-          
-          # 核心修改：传递语言和唤醒词参数
-          python scripts/build.py otto-robot --name otto-robot --language zh-CN --wake-word "ka ka"
+          cp build/merged-binary.bin build/otto-robot-merged.bin
 
-      - name: Upload artifacts
+      - name: Upload merged firmware
         uses: actions/upload-artifact@v4
         with:
-          name: xiaozhi_otto-robot_full
-          path: xiaozhi-esp32/build/merged-binary.bin
+          name: otto-robot-merged-firmware
+          path: build/otto-robot-merged.bin
           if-no-files-found: error
