@@ -989,16 +989,17 @@ config USE_MULTILINE_CHAT_MESSAGE
 
 choice WAKE_WORD_TYPE
     prompt "Wake Word Implementation Type"
-    default WAKE_WORD_DISABLED
+    default USE_CUSTOM_WAKE_WORD
     help
         Choose the type of wake word implementation to use.
         scripts/build.py selects a compatible implementation and model automatically.
         When configuring manually, select the corresponding ESP-SR models as well.
 
-    config WAKE_WORD_DISABLED
-        bool "Disabled"
-        help
-            Disable wake word detection
+    config USE_CUSTOM_WAKE_WORD
+       bool "Multinet model (Custom Wake Word)"
+       depends on (IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31) && SPIRAM
+       help
+           Requires ESP32-S3, ESP32-P4, or ESP32-S31 and PSRAM
 
     config USE_ESP_WAKE_WORD
         bool "Wakenet model without AFE"
@@ -1022,14 +1023,14 @@ endchoice
 
 config CUSTOM_WAKE_WORD
     string "Custom Wake Word"
-    default "xiao tu dou"
+    default "ka ka"
     depends on USE_CUSTOM_WAKE_WORD
     help
         Custom Wake Word, use pinyin for Chinese, separated by spaces
 
 config CUSTOM_WAKE_WORD_DISPLAY
     string "Custom Wake Word Display"
-    default "小土豆"
+    default "卡卡"
     depends on USE_CUSTOM_WAKE_WORD
     help
         Greeting sent to the server after wake word detection
