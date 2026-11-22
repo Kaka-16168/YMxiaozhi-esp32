@@ -12,21 +12,19 @@
                 "CONFIG_HTTPD_WS_SUPPORT=y",
                 "CONFIG_CAMERA_OV2640=y",
                 "CONFIG_CAMERA_OV3660=y",
-                "CONFIG_GC2145_SUPPORT=y"
+                "CONFIG_GC2145_SUPPORT=y",
                 "CONFIG_BOARD_TYPE_OTTO_ROBOT=y",
-        "CONFIG_IDF_TARGET_ESP32S3=y",
-        "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
-        "CONFIG_PARTITION_TABLE_CUSTOM=y",
-        "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/16m.csv\"",
-        "CONFIG_FLASH_DEFAULT_ASSETS=y",
-        "CONFIG_SPIRAM=y",
-        "CONFIG_SPIRAM_MODE_OCT=y",
-        
-        "CONFIG_LANGUAGE_ZH_CN=y",
-        "CONFIG_LANGUAGE_EN_US=n",
-        
-        "CONFIG_USE_DEVICE_AEC=n",
-        "CONFIG_USE_SERVER_AEC=n"
+                "CONFIG_IDF_TARGET_ESP32S3=y",
+                "CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/16m.csv\"",
+                "CONFIG_FLASH_DEFAULT_ASSETS=y",
+                "CONFIG_SPIRAM=y",
+                "CONFIG_SPIRAM_MODE_OCT=y",
+                "CONFIG_LANGUAGE_ZH_CN=y",
+                "CONFIG_LANGUAGE_EN_US=n",
+                "CONFIG_USE_DEVICE_AEC=n",
+                "CONFIG_USE_SERVER_AEC=n"
             ]
         }
     ]
