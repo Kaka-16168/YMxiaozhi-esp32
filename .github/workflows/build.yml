@@ -17,17 +17,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Build otto-robot and merge binary
+        shell: bash  # 关键修复：强制使用 bash 环境
         run: |
-          # 确认脚本存在，避免"脚本没跑对"被误认为构建失败
-          test -f scripts/build.py || { echo "::error::scripts/build.py not found"; exit 1; }
+          . $IDF_PATH/export.sh  # 关键修复：用 POSIX 的 '.' 替代 'source'
           python scripts/build.py otto-robot
 
-      - name: Verify merged binary exists
+      - name: Rename merged binary for easy identification
+        shell: bash
         run: |
-          ls -la build/ || true
-          cp -v build/merged-binary.bin build/otto-robot-merged.bin
+          cp build/merged-binary.bin build/otto-robot-merged.bin
 
       - name: Upload merged firmware
         uses: actions/upload-artifact@v4
