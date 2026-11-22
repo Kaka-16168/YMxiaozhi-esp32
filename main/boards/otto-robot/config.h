@@ -105,12 +105,12 @@ constexpr HardwareConfig CAMERA_VERSION_CONFIG = {
 };
 
 constexpr HardwareConfig NON_CAMERA_VERSION_CONFIG = {
-    .power_charge_detect_pin = GPIO_NUM_21,
+    .power_charge_detect_pin = GPIO_NUM_NC,
     .power_adc_unit = ADC_UNIT_2,
     .power_adc_channel = ADC_CHANNEL_3,
 
-    .right_leg_pin = GPIO_NUM_39,
-    .right_foot_pin = GPIO_NUM_38,
+    .right_leg_pin = GPIO_NUM_41,
+    .right_foot_pin = GPIO_NUM_42,
     .left_leg_pin = GPIO_NUM_17,
     .left_foot_pin = GPIO_NUM_18,
     .left_hand_pin = GPIO_NUM_8,
@@ -135,9 +135,9 @@ constexpr HardwareConfig NON_CAMERA_VERSION_CONFIG = {
     .display_backlight_pin = GPIO_NUM_3,
     .display_mosi_pin = GPIO_NUM_10,
     .display_clk_pin = GPIO_NUM_9,
-    .display_dc_pin = GPIO_NUM_46,
+    .display_dc_pin = GPIO_NUM_13,
     .display_rst_pin = GPIO_NUM_11,
-    .display_cs_pin = GPIO_NUM_12,
+    .display_cs_pin = GPIO_NUM_14,
 
     .i2c_sda_pin = GPIO_NUM_NC,
     .i2c_scl_pin = GPIO_NUM_NC,
