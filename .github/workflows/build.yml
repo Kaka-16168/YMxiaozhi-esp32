@@ -1,40 +1,67 @@
-问题分析
+name: Build Otto Robot Firmware
 
-从截图看，报错信息是：
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
 
-/build/scripts/build.py", line 1
-    #!/usr/bin/env python3
-    ^
-SyntaxError: invalid syntax
+permissions:
+  contents: read
 
+jobs:
+  build-otto-robot:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.1
 
-第 1 行 shebang 就报语法错误，这几乎可以断定是以下原因之一：
+    defaults:
+      run:
+        shell: bash
 
-1. 文件编码问题 — Windows 上编辑时引入了 BOM（字节顺序标记），导致 #! 前面有隐藏字符
-2. 换行符问题 — Windows 的 CRLF 换行导致 shebang 解析异常
-3. 文件被意外截断或损坏 — 你之前在编辑时可能误删了 #! 或引入了不可见字符
+    steps:
+      - name: Trust workspace (fix dubious ownership in container)
+        run: git config --global --add safe.directory '*'
 
-解决方法
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: 'recursive'
 
-我已经把完整的 build.py 重建好了，语法验证通过（OK）。
+      - name: Build otto-robot with custom wake word "卡卡"
+        run: |
+          . $IDF_PATH/export.sh
 
-你需要做的：
+          # 第1步：用 build.py 生成基础配置（不传 --wake-word，避免覆盖）
+          python scripts/build.py otto-robot --language zh-CN
 
-把下载的文件覆盖回仓库的 scripts/build.py，然后提交推送。
+          # 第2步：手动追加自定义唤醒词配置到 sdkconfig
+          # build.py 会强制把 CONFIG_USE_CUSTOM_WAKE_WORD 设为 n
+          # 所以需要在生成配置后手动改回来
+          echo "" >> build/sdkconfig
+          echo "# Custom wake word: 卡卡 (ka ka)" >> build/sdkconfig
+          echo "CONFIG_USE_CUSTOM_WAKE_WORD=y" >> build/sdkconfig
+          echo "CONFIG_SR_MN_CN_MULTINET7_QUANT=y" >> build/sdkconfig
+          echo 'CONFIG_CUSTOM_WAKE_WORD="ka ka"' >> build/sdkconfig
+          echo 'CONFIG_CUSTOM_WAKE_WORD_DISPLAY="卡卡"' >> build/sdkconfig
+          echo "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20" >> build/sdkconfig
+          echo "CONFIG_USE_AFE_WAKE_WORD=n" >> build/sdkconfig
+          echo "CONFIG_USE_ESP_WAKE_WORD=n" >> build/sdkconfig
+          echo "CONFIG_WAKE_WORD_DISABLED=n" >> build/sdkconfig
 
-由于文件在 Windows 上可能再次出现 CRLF 问题，建议在仓库根目录添加 .gitattributes 文件，强制 .py 文件使用 LF 换行：
+          # 第3步：用 idf.py 重新构建（此时 sdkconfig 已包含自定义唤醒词）
+          idf.py build
 
-*.py text eol=lf
-*.sh text eol=lf
+          # 第4步：合并二进制
+          idf.py merge-bin
 
+      - name: Rename merged binary for easy identification
+        run: |
+          cp build/merged-binary.bin build/otto-robot-merged.bin
 
-或者在 Git 中执行：
-git config core.autocrlf input
-git add --renormalize .
-
-
-这样可以确保脚本文件在 Linux 容器中使用正确的换行符。
-
-文件已准备好，请下载后替换仓库中的 scripts/build.py：
-
-build.py
+      - name: Upload merged firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: otto-robot-merged-firmware
+          path: build/otto-robot-merged.bin
+          if-no-files-found: error
