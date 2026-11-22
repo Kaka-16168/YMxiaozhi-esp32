@@ -1,39 +1,40 @@
-name: Build Otto Robot Firmware
+问题分析
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main, master ]
+从截图看，报错信息是：
 
-permissions:
-  contents: read
+/build/scripts/build.py", line 1
+    #!/usr/bin/env python3
+    ^
+SyntaxError: invalid syntax
 
-jobs:
-  build-otto-robot:
-    runs-on: ubuntu-latest
-    container:
-      image: espressif/idf:v6.1
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
+第 1 行 shebang 就报语法错误，这几乎可以断定是以下原因之一：
 
-      - name: Build otto-robot and merge binary
-        shell: bash  # 关键修复：强制使用 bash 环境
-        run: |
-          . $IDF_PATH/export.sh  # 关键修复：用 POSIX 的 '.' 替代 'source'
-          python scripts/build.py otto-robot
+1. 文件编码问题 — Windows 上编辑时引入了 BOM（字节顺序标记），导致 #! 前面有隐藏字符
+2. 换行符问题 — Windows 的 CRLF 换行导致 shebang 解析异常
+3. 文件被意外截断或损坏 — 你之前在编辑时可能误删了 #! 或引入了不可见字符
 
-      - name: Rename merged binary for easy identification
-        shell: bash
-        run: |
-          cp build/merged-binary.bin build/otto-robot-merged.bin
+解决方法
 
-      - name: Upload merged firmware
-        uses: actions/upload-artifact@v4
-        with:
-          name: otto-robot-merged-firmware
-          path: build/otto-robot-merged.bin
-          if-no-files-found: error
+我已经把完整的 build.py 重建好了，语法验证通过（OK）。
+
+你需要做的：
+
+把下载的文件覆盖回仓库的 scripts/build.py，然后提交推送。
+
+由于文件在 Windows 上可能再次出现 CRLF 问题，建议在仓库根目录添加 .gitattributes 文件，强制 .py 文件使用 LF 换行：
+
+*.py text eol=lf
+*.sh text eol=lf
+
+
+或者在 Git 中执行：
+git config core.autocrlf input
+git add --renormalize .
+
+
+这样可以确保脚本文件在 Linux 容器中使用正确的换行符。
+
+文件已准备好，请下载后替换仓库中的 scripts/build.py：
+
+build.py
