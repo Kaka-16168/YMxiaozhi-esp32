@@ -1,45 +1,37 @@
-name: Build Boards
+name: Build Otto Robot Firmware
+
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
 
 permissions:
   contents: read
 
 jobs:
-  build_otto:
-    name: Build otto-robot
+  build-otto-robot:
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:release-v6.1
+      image: espressif/idf:v6.1
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build and Merge Full Firmware
-        shell: bash
+      - name: Build otto-robot and merge binary
         run: |
-          source "$IDF_PATH/export.sh"
-          cd xiaozhi-esp32
-          
-          rm -f sdkconfig sdkconfig.old
-          rm -rf build
-          
-          python scripts/gen_lang.py --language zh-CN --output main/assets/lang_config.h
-          idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3" build
-          
-          cd build
-          esptool.py --chip esp32s3 merge_bin -o otto-firmware-full.bin \
-            --flash_mode dio --flash_freq 40m --flash_size 16MB \
-            0x0 bootloader/bootloader.bin \
-            0x8000 partition_table/partition-table.bin \
-            0x10000 xiaozhi.bin \
-            0x810000 generated_assets.bin
+          # 确认脚本存在，避免"脚本没跑对"被误认为构建失败
+          test -f scripts/build.py || { echo "::error::scripts/build.py not found"; exit 1; }
+          python scripts/build.py otto-robot
 
-      - name: Upload artifacts
+      - name: Verify merged binary exists
+        run: |
+          ls -la build/ || true
+          cp -v build/merged-binary.bin build/otto-robot-merged.bin
+
+      - name: Upload merged firmware
         uses: actions/upload-artifact@v4
         with:
-          name: xiaozhi_otto-robot_full
-          path: xiaozhi-esp32/build/otto-firmware-full.bin
+          name: otto-robot-merged-firmware
+          path: build/otto-robot-merged.bin
           if-no-files-found: error
