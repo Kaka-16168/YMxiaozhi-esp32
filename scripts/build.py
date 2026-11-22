@@ -340,6 +340,21 @@ def _wake_word_sdkconfig_options(
     elif normalized == "hiesp":
         normalized = "wn9s_hiesp" if target in _LITE_WAKE_WORD_TARGETS else "wn9_hiesp"
 
+    # ===== 新增：拦截自定义唤醒词 =====
+    if normalized in {"ka_ka", "ka ka", "kaka"}:
+        options = [
+            "CONFIG_WAKE_WORD_DISABLED=n",
+            "CONFIG_USE_ESP_WAKE_WORD=n",
+            "CONFIG_USE_AFE_WAKE_WORD=n",
+            "CONFIG_USE_CUSTOM_WAKE_WORD=y",
+            "CONFIG_SR_MN_CN_MULTINET7_QUANT=y",
+            "CONFIG_CUSTOM_WAKE_WORD=\"ka ka\"",
+            "CONFIG_CUSTOM_WAKE_WORD_DISPLAY=\"卡卡\"",
+            "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20"
+        ]
+        return "ka ka", options, ["CONFIG_USE_CUSTOM_WAKE_WORD", "CONFIG_SR_MN_CN_MULTINET7_QUANT"]
+    # ==================================
+
     # Every build starts from a fresh sdkconfig. Models default to disabled in
     # ESP-SR; board and target presets must not select a particular model.
     options = [
@@ -358,7 +373,7 @@ def _wake_word_sdkconfig_options(
     if not _WAKE_WORD_MODEL_PATTERN.fullmatch(normalized):
         raise ValueError(
             f"Invalid wake word {wake_word!r}. Use 'disabled', "
-            "'nihaoxiaozhi', 'hiesp', or an ESP-SR model name such as "
+            "'nihaoxiaozhi', 'hiesp', 'ka ka', or an ESP-SR model name such as "
             "'wn9_jarvis_tts'."
         )
     if target in _LITE_WAKE_WORD_TARGETS and not normalized.startswith("wn9s_"):
@@ -396,16 +411,11 @@ _DYNAMIC_CAMERA_MIRROR_BOARD_CONFIGS = {
     "CONFIG_BOARD_TYPE_M5STACK_ATOM_S3R_CAM_M12_ECHO_BASE",
     "CONFIG_BOARD_TYPE_SEEED_STUDIO_SENSECAP_WATCHER",
 }
-_AUTO_CAMERA_ORIENTATION_BOARD_CONFIGS = {
-    # These boards provide sensor-specific defaults while allowing explicit overrides.
-    "CONFIG_BOARD_TYPE_ESP32_S31_KORVO_1",
-}
 _OPTIONAL_CAMERA_ENABLE_SYMBOLS = {
     # ESP-VOCAT only constructs EspVideo when its optional USB UVC transport
     # is enabled. Do not advertise mirror controls for the camera-less default
     # build, but expose them automatically for an explicitly enabled variant.
     "CONFIG_BOARD_TYPE_ESP_VOCAT": "CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE",
-    "CONFIG_BOARD_TYPE_CYBERAI_VOCAT_V2_0": "CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE",
 }
 # Match both `new Esp32Camera` and `new (std::nothrow) Esp32Camera` (and EspVideo).
 _COMMON_CAMERA_CONSTRUCTOR_RE = re.compile(
@@ -509,7 +519,6 @@ def _build_option_definitions(
         raise ValueError(f"build {build.get('name')!r} sdkconfig_append must be a string list")
     assignments = _sdkconfig_assignments(sdkconfig_append)
     source = _board_source_text(board)
-    display_symbols = set(re.findall(r"\bCONFIG_(?:OLED|LCD)_[A-Z0-9_]+\b", source))
     definitions: list[dict[str, Any]] = []
 
     network_choice = _kconfig_choice("XIAOZHI_NETWORK_TYPE")
@@ -532,16 +541,7 @@ def _build_option_definitions(
         choice = _kconfig_choice(choice_name)
         if board_config not in choice["board_configs"]:
             continue
-        # A shared Kconfig choice can contain panels that this board has not
-        # implemented. Only expose models selected by its own source/config;
-        # fixed-display boards with no model branches need no selector.
-        entries = [
-            entry for entry in choice["entries"]
-            if entry["value"] != "LCD_CUSTOM"
-            and f"CONFIG_{entry['value']}" in display_symbols
-        ]
-        if not entries:
-            continue
+        entries = [entry for entry in choice["entries"] if entry["value"] != "LCD_CUSTOM"]
         definitions.append({
             "key": "display_model",
             "type": "select",
@@ -620,16 +620,6 @@ def _build_option_definitions(
         )
     )
     if has_common_camera and board_config not in _DYNAMIC_CAMERA_MIRROR_BOARD_CONFIGS:
-        if board_config in _AUTO_CAMERA_ORIENTATION_BOARD_CONFIGS:
-            definitions.append({
-                "key": "camera_orientation",
-                "type": "select",
-                "default": "auto",
-                "choices": [
-                    {"value": "auto", "label": "Sensor default"},
-                    {"value": "manual", "label": "Manual"},
-                ],
-            })
         definitions.extend((
             {"key": "camera_hmirror", "type": "boolean", "default": False},
             {"key": "camera_vflip", "type": "boolean", "default": False},
@@ -679,13 +669,6 @@ def _normalize_build_options(
                 )
         normalized[key] = value
 
-    if (
-        "camera_orientation" in by_key
-        and "camera_orientation" not in requested
-        and {"camera_hmirror", "camera_vflip"}.intersection(requested)
-    ):
-        normalized["camera_orientation"] = "manual"
-
     if normalized.get("display_style") != "default" and "multiline_chat" in normalized:
         normalized["multiline_chat"] = False
     return normalized
@@ -709,13 +692,13 @@ def _build_options_sdkconfig(
 
     if "display_model" in options:
         selected = options["display_model"]
-        # Clear the entire shared choice, including panels hidden for this
-        # board, so a previous configuration cannot keep an unsupported model.
-        choice_name = (
-            "DISPLAY_LCD_TYPE" if str(selected).startswith("LCD_") else "DISPLAY_OLED_TYPE"
-        )
-        for choice in _kconfig_choice(choice_name)["entries"]:
+        for choice in by_key["display_model"]["choices"]:
             result.append(f"CONFIG_{choice['value']}={'y' if choice['value'] == selected else 'n'}")
+        if isinstance(selected, str) and selected.startswith("LCD_"):
+            # LCD_CUSTOM is intentionally not exposed in the cloud UI because
+            # it requires source-level panel configuration, but it is still a
+            # sibling in the Kconfig choice and must be disabled explicitly.
+            result.append("CONFIG_LCD_CUSTOM=n")
 
     if "display_style" in options:
         selected = options["display_style"]
@@ -759,9 +742,7 @@ def _build_options_sdkconfig(
             f"CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING={'y' if blufi else 'n'}",
         ))
 
-    if options.get("camera_orientation") == "auto":
-        result.append("CONFIG_XIAOZHI_CAMERA_MIRROR_CONFIGURED=n")
-    elif "camera_hmirror" in options or "camera_vflip" in options:
+    if "camera_hmirror" in options or "camera_vflip" in options:
         result.extend((
             "CONFIG_XIAOZHI_CAMERA_MIRROR_CONFIGURED=y",
             f"CONFIG_XIAOZHI_CAMERA_HMIRROR={'y' if options.get('camera_hmirror') else 'n'}",
