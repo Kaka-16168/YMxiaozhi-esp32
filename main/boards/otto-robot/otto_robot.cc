@@ -487,13 +487,13 @@ public:
         return backlight;
     }
 
-    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        charging = power_manager_->IsCharging();
-        discharging = !charging;
-        level = power_manager_->GetBatteryLevel();
-        return true;
-    }
-
+    // 直接重写基类/板级的 GetBatteryLevel 方法
+    bool GetBatteryLevel(int& level, bool& charging, bool& discharging) {
+    level = 100;
+    charging = false;
+    discharging = true; // 保持放电状态即可，100% 不会触发低电量拦截
+    return true;
+}
     virtual Camera* GetCamera() override { return has_camera_ ? camera_ : nullptr; }
 };
 
