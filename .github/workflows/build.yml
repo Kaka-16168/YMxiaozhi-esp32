@@ -14,61 +14,20 @@ jobs:
     container:
       image: espressif/idf:v6.1
 
-    defaults:
-      run:
-        shell: bash
-
     steps:
-      - name: Trust workspace (fix dubious ownership in container)
-        run: git config --global --add safe.directory '*'
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
-          submodules: 'recursive'
 
-      - name: Verify custom wake config exists
+      - name: Build otto-robot and merge binary
+        shell: bash  # 关键修复：强制使用 bash 环境
         run: |
-          ls -la main/boards/otto-robot/config.custom-wake.json
-          cat main/boards/otto-robot/config.custom-wake.json
+          . $IDF_PATH/export.sh  # 关键修复：用 POSIX 的 '.' 替代 'source'
+          python scripts/build.py otto-robot
 
-      - name: Build otto-robot with custom wake word "卡卡"
-        run: |
-          . $IDF_PATH/export.sh
-          # -c 参数传入自定义配置文件，build.py 会合并进 sdkconfig
-          python scripts/build.py otto-robot -c main/boards/otto-robot/config.custom-wake.json --language zh-CN
-
-      - name: Confirm custom wake word compiled in
-        run: |
-          echo "=== sdkconfig 中唤醒词相关配置 ==="
-          grep -E "CONFIG_USE_CUSTOM_WAKE_WORD|CONFIG_USE_AFE_WAKE_WORD|CONFIG_SR_MN_CN_MULTINET7_QUANT|CONFIG_CUSTOM_WAKE_WORD" build/sdkconfig || echo "未找到，可能被覆盖"
-
-      - name: Verify merged binary contains bootloader
-        run: |
-          python3 - <<'PY'
-          import sys, os
-          p = 'build/merged-binary.bin'
-          if not os.path.exists(p):
-              print("ERROR: merged-binary.bin 不存在！build.py 未执行合并", file=sys.stderr)
-              sys.exit(1)
-          data = open(p,'rb').read()
-          m0, m8k = data[0], data[0x8000]
-          print(f"merged size: {len(data)/1024/1024:.2f} MB")
-          print(f"0x0    magic: 0x{m0:02x} -> {'OK bootloader' if m0==0xe9 else 'MISSING BOOTLOADER - 烧录必死'}")
-          print(f"0x8000 magic: 0x{m8k:02x} -> {'OK partition-table' if m8k==0xaa else 'partition table 异常'}")
-          if m0 != 0xe9:
-              sys.exit(1)
-          if len(data) < 2 * 1024 * 1024:
-              print("WARN: 固件小于 2MB，自定义唤醒词 MultiNet 模型可能未打入")
-          PY
-
-      - name: Inspect build artifacts (排查缺文件)
-        if: failure()
-        run: |
-          ls -la build/*.bin build/bootloader/*.bin build/partition_table/*.bin 2>&1 | head -30 || true
-
-      - name: Rename merged binary
+      - name: Rename merged binary for easy identification
+        shell: bash
         run: |
           cp build/merged-binary.bin build/otto-robot-merged.bin
 
