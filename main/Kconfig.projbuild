@@ -990,6 +990,7 @@ config USE_MULTILINE_CHAT_MESSAGE
 choice WAKE_WORD_TYPE
     prompt "Wake Word Implementation Type"
     default USE_CUSTOM_WAKE_WORD
+    default y
     help
         Choose the type of wake word implementation to use.
         scripts/build.py selects a compatible implementation and model automatically.
@@ -1003,18 +1004,21 @@ choice WAKE_WORD_TYPE
 
     config USE_ESP_WAKE_WORD
         bool "Wakenet model without AFE"
+       default n
         depends on IDF_TARGET_ESP32C3 || IDF_TARGET_ESP32C5 || IDF_TARGET_ESP32C6 || (IDF_TARGET_ESP32 && SPIRAM)
         help
             Support ESP32 C3、ESP32 C5 与 ESP32 C6, and (ESP32 with PSRAM)
 
     config USE_AFE_WAKE_WORD
         bool "Wakenet model with AFE"
+        default n
         depends on (IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31) && SPIRAM
         help
             Support AEC if available, requires ESP32-S3, ESP32-P4, or ESP32-S31 and PSRAM
 
     config USE_CUSTOM_WAKE_WORD
         bool "Multinet model (Custom Wake Word)"
+        default y
         depends on (IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4 || IDF_TARGET_ESP32S31) && SPIRAM
         help
             Requires ESP32-S3, ESP32-P4, or ESP32-S31 and PSRAM
