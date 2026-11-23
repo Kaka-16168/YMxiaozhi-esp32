@@ -617,7 +617,7 @@ def _build_option_definitions(
             {"key": "camera_vflip", "type": "boolean", "default": False},
         ))
 
-    # ==================== 修复：增加 camera_orientation 防报错 ====================
+    # 增加 camera_orientation 防报错
     if "camera_orientation" not in {d["key"] for d in definitions}:
         definitions.append({
             "key": "camera_orientation",
@@ -625,11 +625,16 @@ def _build_option_definitions(
             "default": "none",
             "choices": [{"value": "none", "label": "None"}],
         })
-    # =============================================================================
 
     configured_defaults = build.get("build_options", {})
     if not isinstance(configured_defaults, dict):
         raise ValueError(f"build {build.get('name')!r} build_options must be an object")
+    
+    # ==================== 终极修复：剔除上游冲突的 camera_orientation ====================
+    # 因为某些板子的 config.json 里面硬编码了 camera_orientation 的其他值，会导致校验失败，这里直接将其移除
+    configured_defaults.pop("camera_orientation", None)
+    # ===================================================================================
+
     by_key = {definition["key"]: definition for definition in definitions}
     unknown_defaults = sorted(set(configured_defaults) - set(by_key))
     if unknown_defaults:
