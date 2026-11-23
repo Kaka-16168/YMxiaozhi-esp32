@@ -332,7 +332,7 @@ def _wake_word_sdkconfig_options(
     """Map a wake-word model to implementation and model Kconfig options."""
     normalized = wake_word.strip().casefold().replace("-", "_")
     
-    # ==================== 新增：支持自定义唤醒词"卡卡" ====================
+    # ==================== 修复：自定义唤醒词“卡卡” + 绑定中文MultiNet模型 ====================
     raw_clean = wake_word.strip()
     if raw_clean in {"ka ka", "kaka", "ka_ka", "卡卡"}:
         options = [
@@ -342,12 +342,14 @@ def _wake_word_sdkconfig_options(
             "CONFIG_USE_CUSTOM_WAKE_WORD=y",
             'CONFIG_CUSTOM_WAKE_WORD="ka ka"',
             'CONFIG_CUSTOM_WAKE_WORD_DISPLAY="卡卡"',
-            # 强制关闭常见冲突模型
+            # 关键修复：指定中文 MultiNet 模型（解决 assets 生成报错）
+            "CONFIG_SR_MN_CN_MULTINET7_QUANT=y",
+            # 强制关闭冲突模型
             "CONFIG_SR_WN_WN9_HIESP=n",
             "CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=n"
         ]
-        return "ka ka", options, ["CONFIG_USE_CUSTOM_WAKE_WORD"]
-    # ==================================================================
+        return "ka ka", options, ["CONFIG_USE_CUSTOM_WAKE_WORD", "CONFIG_SR_MN_CN_MULTINET7_QUANT"]
+    # ===================================================================================
 
     if normalized == "nihaoxiaozhi":
         normalized = (
