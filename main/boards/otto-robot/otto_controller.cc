@@ -62,6 +62,7 @@ private:
         ACTION_GREETING = 23,  // 打招呼
         ACTION_SHY = 24,        // 害羞
         ACTION_SIT = 25,  // 坐下
+        ACTION_SHOWCASE = 28, 
         ACTION_HOME = 17,
         ACTION_SERVO_SEQUENCE = 18,  // 舵机序列（自编程）
         ACTION_WHIRLWIND_LEG = 19    // 旋风腿
