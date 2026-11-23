@@ -45,7 +45,6 @@ private:
         ACTION_MOONWALK = 5,
         ACTION_BEND = 6,
         ACTION_SHAKE_LEG = 7,
-        ACTION_SIT = 25,  // 坐下
         ACTION_RADIO_CALISTHENICS = 26,  // 广播体操
         ACTION_MAGIC_CIRCLE = 27,  // 爱的魔力转圈圈
         ACTION_UPDOWN = 8,
@@ -62,7 +61,7 @@ private:
         ACTION_FITNESS = 22,   // 健身
         ACTION_GREETING = 23,  // 打招呼
         ACTION_SHY = 24,        // 害羞
-        ACTION_SHOWCASE = 28,   // 展示动作
+        ACTION_SIT = 25,  // 坐下
         ACTION_HOME = 17,
         ACTION_SERVO_SEQUENCE = 18,  // 舵机序列（自编程）
         ACTION_WHIRLWIND_LEG = 19    // 旋风腿
@@ -140,7 +139,7 @@ private:
                                             }
                                         }
                                         
-                                        // 读取中心角度（短键名 "o"），默认90度（绝对角度0-180度）
+                                        // 读取中心角度（短键名 "o"，默认90度，绝对角度0-180度）
                                         for (int j = 0; j < SERVO_COUNT; j++) {
                                             center_angle[j] = 90;  // 默认中心角度90度（中间位置）
                                         }
@@ -526,6 +525,13 @@ public:
         RegisterMcpTools();
     }
 
+    // ======== 新增：供 OttoRobot 软关机调用的归位接口 ========
+    // 作为成员方法，可访问本类 private 的 QueueAction 与 ACTION_HOME 枚举
+    void RequestHome() {
+        QueueAction(ACTION_HOME, 1, 1000, 1, 0);
+        ESP_LOGI(TAG, "已请求 Otto 归位到中立姿态");
+    }
+
     void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
 
@@ -673,7 +679,7 @@ public:
             "机器人结构：双手可上下摆动，双腿可内收外展，双脚可上下翻转。"
             "舵机说明："
             "ll(左腿)：内收外展，0度=完全外展，90度=中立，180度=完全内收；"
-            "rl(右腿)：内收外展，0度=完全内收，90度=中立，180度=完全外展；"
+            "rl(右腿)：内收外展，0度=完全内收，90度=中立，180度=完全内展；"
             "lf(左脚)：上下翻转，0度=完全向上，90度=水平，180度=完全向下；"
             "rf(右脚)：上下翻转，0度=完全向下，90度=水平，180度=完全向上；"
             "lh(左手)：上下摆动，0度=完全向下，90度=水平，180度=完全向上；"
