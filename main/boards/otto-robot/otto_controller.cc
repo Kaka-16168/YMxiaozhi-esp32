@@ -62,7 +62,7 @@ private:
         ACTION_GREETING = 23,  // 打招呼
         ACTION_SHY = 24,        // 害羞
         ACTION_SIT = 25,  // 坐下
-        ACTION_SHOWCASE = 28, 
+        ACTION_SHOWCASE = 28,   // 展示动作
         ACTION_HOME = 17,
         ACTION_SERVO_SEQUENCE = 18,  // 舵机序列（自编程）
         ACTION_WHIRLWIND_LEG = 19    // 旋风腿
@@ -853,11 +853,23 @@ public:
     }
 };
 
-static OttoController* g_otto_controller = nullptr;
+// 注意：不能加 static。static 会让符号仅在本文件可见，
+// otto_robot.cc 里的 extern 声明链接不到，报 undefined reference。
+OttoController* g_otto_controller = nullptr;
 
 void InitializeOttoController(const HardwareConfig& hw_config) {
     if (g_otto_controller == nullptr) {
         g_otto_controller = new OttoController(hw_config);
         ESP_LOGI(TAG, "Otto控制器已初始化并注册MCP工具");
+    }
+}
+
+// ======== 供 otto_robot.cc 软关机调用的归位入口 ========
+// 用 C 链接，符号名不受 C++ name mangling 影响，跨文件链接最稳。
+extern "C" void OttoController_RequestHome(void) {
+    if (g_otto_controller != nullptr) {
+        g_otto_controller->RequestHome();
+    } else {
+        ESP_LOGW(TAG, "OttoController 尚未初始化，无法归位");
     }
 }
