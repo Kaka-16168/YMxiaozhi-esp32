@@ -617,6 +617,16 @@ def _build_option_definitions(
             {"key": "camera_vflip", "type": "boolean", "default": False},
         ))
 
+    # ==================== 修复：增加 camera_orientation 防报错 ====================
+    if "camera_orientation" not in {d["key"] for d in definitions}:
+        definitions.append({
+            "key": "camera_orientation",
+            "type": "select",
+            "default": "none",
+            "choices": [{"value": "none", "label": "None"}],
+        })
+    # =============================================================================
+
     configured_defaults = build.get("build_options", {})
     if not isinstance(configured_defaults, dict):
         raise ValueError(f"build {build.get('name')!r} build_options must be an object")
