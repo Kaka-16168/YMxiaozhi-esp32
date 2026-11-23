@@ -150,13 +150,13 @@ constexpr HardwareConfig NON_CAMERA_VERSION_CONFIG = {
 
     /*
      * 功放
-     * LRCLK -> GPIO4
-     * BCLK  -> GPIO5
+     * LRCLK -> GPIO15
+     * BCLK  -> GPIO16
      * DIN   -> GPIO7
      */
     .audio_i2s_spk_gpio_dout = GPIO_NUM_7,
-    .audio_i2s_spk_gpio_bclk = GPIO_NUM_5,
-    .audio_i2s_spk_gpio_lrck = GPIO_NUM_4,
+    .audio_i2s_spk_gpio_bclk = GPIO_NUM_16,
+    .audio_i2s_spk_gpio_lrck = GPIO_NUM_15,
 
     /*
      * 1.54寸 ST7789 四线SPI
