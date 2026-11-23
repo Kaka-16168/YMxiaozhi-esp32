@@ -1,12 +1,3 @@
-/*
-    Otto 机器人板级支持 - 基于摄像头版原码
-    在保留原码全部 LEDC 功能（摄像头 XCLK + PWM 背光）的基础上，
-    新增：
-      1) self.Alarm       —— 一次性高分辨率定时器闹钟
-      2) self.Shutdown    —— 语音提示后软关机（舵机归位 + 关屏）
-    不引入任何 otto_pca_adapter / PCA 舵机依赖，舵机归位统一走 OttoController 队列。
-*/
-
 #include <driver/i2c_master.h>
 #include <driver/ledc.h>
 #include <driver/spi_common.h>
@@ -15,10 +6,8 @@
 #include <esp_lcd_panel_vendor.h>
 #include <esp_log.h>
 #include <esp_rom_sys.h>
-#include <esp_timer.h>
 
 #include <new>
-#include <string>
 
 #include "application.h"
 #include "button.h"
@@ -34,14 +23,10 @@
 #include "system_reset.h"
 #include "websocket_control_server.h"
 #include "wifi_board.h"
-#include "assets/lang_config.h"
 
 #define TAG "OttoRobot"
 
-// ======== OttoController 对外接口声明 ========
 extern void InitializeOttoController(const HardwareConfig& hw_config);
-// 触发一次中立姿态归位（封装在 OttoController.cpp 内部，避免暴露 private 枚举与队列细节）
-extern void OttoControllerRequestHome();
 
 class OttoRobot : public WifiBoard {
 private:
@@ -56,10 +41,6 @@ private:
     bool is_camera_board_;
     bool has_camera_;
     OttoCameraType camera_type_;
-
-    // ======== 闹钟相关成员 ========
-    esp_timer_handle_t alarm_timer_ = nullptr;
-    std::string alarm_name_;
 
     bool DetectHardwareVersion() {
         constexpr gpio_num_t kDetectGpio15 = GPIO_NUM_15;
@@ -142,7 +123,6 @@ private:
     }
 
     bool DetectCamera() {
-        // 摄像头 XCLK 由 LEDC 输出，保留原码逻辑
         ledc_timer_config_t ledc_timer = {
             .speed_mode = LEDC_LOW_SPEED_MODE,
             .duty_resolution = LEDC_TIMER_2_BIT,
@@ -189,7 +169,6 @@ private:
             ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL, 0);
             return false;
         }
-
         const uint8_t camera_addresses[] = {0x30, 0x3C, 0x21, 0x60};
         bool camera_found = false;
         bool unknown_camera_found = false;
@@ -275,6 +254,7 @@ private:
             ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL, 0);
             camera_type_ = OTTO_CAMERA_NONE;
         } else {
+            // 根据 PID 判断摄像头类型
             if (detected_pid == OTTO_OV2640_PID_1 || detected_pid == OTTO_OV2640_PID_2) {
                 camera_type_ = OTTO_CAMERA_OV2640;
                 ESP_LOGI(TAG, "摄像头类型: OV2640 (PID=0x%04X)", detected_pid);
@@ -329,6 +309,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
 
         esp_lcd_panel_reset(panel);
+
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, DISPLAY_INVERT_COLOR);
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
@@ -352,119 +333,9 @@ private:
 
     void InitializeOttoController() { ::InitializeOttoController(hw_config_); }
 
-    // ======== 新增：注册自定义 MCP 工具（闹钟、关机）========
-    void InitializeCustomMcpTools() {
-        auto& mcp_server = McpServer::GetInstance();
-
-        // 1. 闹钟工具
-        mcp_server.AddTool(
-            "self.Alarm",
-            "设置一个闹钟。seconde_from_now: 多少秒后响铃；alarm_name: 闹钟的名称或提醒内容",
-            PropertyList({
-                Property("seconde_from_now", kPropertyTypeInteger, 10, 0, 86400),
-                Property("alarm_name", kPropertyTypeString),
-            }),
-            [this](const PropertyList& properties) -> ReturnValue {
-                int seconds = properties["seconde_from_now"].value<int>();
-                std::string name = properties["alarm_name"].value<std::string>();
-
-                if (seconds <= 0) {
-                    return ReturnValue("闹钟时间必须大于 0 秒");
-                }
-                alarm_name_ = name;
-
-                // 若已有闹钟，先停掉再重建，避免句柄泄漏
-                if (alarm_timer_ != nullptr) {
-                    esp_timer_stop(alarm_timer_);
-                    esp_timer_delete(alarm_timer_);
-                    alarm_timer_ = nullptr;
-                }
-
-                esp_timer_create_args_t args = {};
-                args.callback = &OttoRobot::AlarmTimerCallback;
-                args.arg = this;
-                args.dispatch_method = ESP_TIMER_TASK;
-                args.name = "otto_alarm";
-
-                if (esp_timer_create(&args, &alarm_timer_) != ESP_OK) {
-                    return ReturnValue("闹钟创建失败");
-                }
-                esp_timer_start_once(alarm_timer_, (uint64_t)seconds * 1000000ULL);
-
-                ESP_LOGI(TAG, "闹钟已设置: %d 秒后 -> %s", seconds, alarm_name_.c_str());
-                return ReturnValue("闹钟设置成功");
-            });
-
-        // 2. 语音关机工具
-        mcp_server.AddTool(
-            "self.Shutdown",
-            "关闭机器人。舵机归位到中立姿态，屏幕彻底关闭，进入待机状态。",
-            PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
-                Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
-                vTaskDelay(pdMS_TO_TICKS(600));
-                EnterSoftShutdown();
-                return ReturnValue("已关机");
-            });
-    }
-
-    // ======== 新增：闹钟回调与执行逻辑 ========
-    static void AlarmTimerCallback(void* arg) {
-        auto* self = static_cast<OttoRobot*>(arg);
-        if (self != nullptr) {
-            self->HandleAlarm();
-        }
-    }
-
-    void HandleAlarm() {
-        ESP_LOGI(TAG, "闹钟触发: %s", alarm_name_.c_str());
-
-        if (display_ != nullptr) {
-            display_->SetEmotion("excited");
-            display_->SetChatMessage("system", alarm_name_.c_str());
-        }
-
-        // 异步播放提示音，不在定时器回调里阻塞
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
-
-        // 单次定时器触发后即视为停止，删除句柄
-        if (alarm_timer_ != nullptr) {
-            esp_timer_delete(alarm_timer_);
-            alarm_timer_ = nullptr;
-        }
-    }
-
-    // ======== 新增：软关机执行逻辑 ========
-    void EnterSoftShutdown() {
-        ESP_LOGI(TAG, "进入软关机序列");
-
-        // 1. 停止并删除闹钟
-        if (alarm_timer_ != nullptr) {
-            esp_timer_stop(alarm_timer_);
-            esp_timer_delete(alarm_timer_);
-            alarm_timer_ = nullptr;
-        }
-
-        // 2. 通过 OttoController 归位到中立姿态（走 ActionTask 队列，与 self.otto.home 一致）
-        //    这样不会重新 attach LEDC 通道，避免舵机丢失 PWM。
-        OttoControllerRequestHome();
-        // 给归位动作留一点入队与执行时间（Home 内部约 1s，关机场景不必精确等完）
-        vTaskDelay(pdMS_TO_TICKS(200));
-
-        // 3. 清理屏幕内容并彻底关闭背光（仍使用原码 LEDC PWM 背光，无 PCA）
-        if (display_ != nullptr) {
-            display_->SetChatMessage("system", "");
-            display_->SetEmotion("neutral");
-        }
-        if (GetBacklight() != nullptr) {
-            GetBacklight()->SetBrightness(0);
-        }
-
-        ESP_LOGI(TAG, "软关机完成");
-    }
-
 public:
     const HardwareConfig& GetHardwareConfig() const { return hw_config_; }
+
     OttoCameraType GetCameraType() const { return camera_type_; }
 
 private:
@@ -480,6 +351,7 @@ private:
     void StartNetwork() override {
         WifiBoard::StartNetwork();
         vTaskDelay(pdMS_TO_TICKS(1000));
+
         InitializeWebSocketControlServer();
     }
 
@@ -525,7 +397,8 @@ private:
         camera_ = new (std::nothrow) Esp32Camera(config);
         if (camera_ != nullptr && camera_type_ == OTTO_CAMERA_GC2145) {
             // The GC2145 module is mounted 180 degrees relative to the OV sensors.
-            // Undo the board-wide hmirror/vflip for this sensor only.
+            // Undo the board-wide hmirror/vflip for this sensor only. Preview
+            // rotation is shared by all Otto camera modules (see OttoEmojiDisplay).
             camera_->SetHMirror(false);
             camera_->SetVFlip(false);
             ESP_LOGI(TAG, "GC2145 orientation corrected (hmirror=0, vflip=0)");
@@ -556,8 +429,7 @@ public:
           camera_(nullptr),
           is_camera_board_(false),
           has_camera_(false),
-          camera_type_(OTTO_CAMERA_NONE),
-          alarm_timer_(nullptr) {
+          camera_type_(OTTO_CAMERA_NONE) {
 #if OTTO_HARDWARE_VERSION == OTTO_VERSION_AUTO
         // GPIO15/GPIO16 在摄像头版上有外部上拉；无摄像头版由内部弱下拉保持为低。
         is_camera_board_ = DetectHardwareVersion();
@@ -573,11 +445,10 @@ public:
     "OTTO_HARDWARE_VERSION 设置无效，请使用 OTTO_VERSION_AUTO, OTTO_VERSION_CAMERA 或 OTTO_VERSION_NO_CAMERA"
 #endif
 
-        if (is_camera_board_) {
+        if (is_camera_board_)
             hw_config_ = CAMERA_VERSION_CONFIG;
-        } else {
+        else
             hw_config_ = NON_CAMERA_VERSION_CONFIG;
-        }
 
         if (is_camera_board_) {
             has_camera_ = DetectCamera();
@@ -599,15 +470,12 @@ public:
         }
 
         InitializeOttoController();
-
-        // ======== 新增：注册 MCP 工具 ========
-        InitializeCustomMcpTools();
-
         ws_control_server_ = nullptr;
         GetBacklight()->RestoreBrightness();
     }
 
     virtual AudioCodec* GetAudioCodec() override { return audio_codec_; }
+
     virtual Display* GetDisplay() override { return display_; }
 
     virtual Backlight* GetBacklight() override {
@@ -619,14 +487,13 @@ public:
         return backlight;
     }
 
-    // 板级的 GetBatteryLevel 方法
+    // 直接重写基类/板级的 GetBatteryLevel 方法
     bool GetBatteryLevel(int& level, bool& charging, bool& discharging) {
-        level = 100;
-        charging = false;
-        discharging = true;  // 保持放电状态即可，100% 不会触发低电量拦截
-        return true;
-    }
-
+    level = 100;
+    charging = false;
+    discharging = true; // 保持放电状态即可，100% 不会触发低电量拦截
+    return true;
+}
     virtual Camera* GetCamera() override { return has_camera_ ? camera_ : nullptr; }
 };
 
