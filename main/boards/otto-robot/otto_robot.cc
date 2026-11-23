@@ -31,13 +31,10 @@
 
 extern void InitializeOttoController(const HardwareConfig& hw_config);
 
-// ======== 声明 OttoController 类，只暴露我们需要的公开接口 ========
-class OttoController {
-public:
-    void RequestHome();   // 归位到中立姿态（软关机时调用）
-};
-
-extern OttoController* g_otto_controller;
+// ======== 软关机归位入口（定义在 otto_controller.cc）========
+// 用 C 链接函数而不是 extern 变量：符号名不受 C++ name mangling 影响，
+// 且这里不需要看到 OttoController 的完整类定义。
+extern "C" void OttoController_RequestHome(void);
 
 class OttoRobot : public WifiBoard {
 private:
@@ -439,13 +436,10 @@ private:
         }
 
         // 2. 舵机归位（走 OttoController 内部队列，与 self.otto.home 一致）
-        if (g_otto_controller != nullptr) {
-            g_otto_controller->RequestHome();
-            // Home 内部 MoveServos(1000, ...) 约 1 秒，等到位再黑屏
-            vTaskDelay(pdMS_TO_TICKS(1200));
-        } else {
-            ESP_LOGW(TAG, "OttoController 未初始化，跳过舵机归位");
-        }
+        // 走 OttoController 内部队列执行 Home，与 self.otto.home 一致
+        OttoController_RequestHome();
+        // Home 内部 MoveServos(1000, ...) 约 1 秒，等舵机真正到位后再黑屏
+        vTaskDelay(pdMS_TO_TICKS(1200));
 
         // 3. 清理屏幕并关背光（LEDC PWM，无 PCA）
         if (display_ != nullptr) {
