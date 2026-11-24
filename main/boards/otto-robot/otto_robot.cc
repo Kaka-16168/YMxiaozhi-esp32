@@ -31,6 +31,13 @@
 
 #define TAG "OttoRobot"
 
+// 本地时区相对 UTC 的偏移（小时）。东八区填 8；ClockTimeStr / ClockDateStr
+// 用它把 SNTP 校准后的 UTC 秒换算成本地时间。用 #ifndef 包裹，避免与其它
+// 头文件里的同名宏重复定义。
+#ifndef TIME_ZONE_UTC_OFFSET
+#define TIME_ZONE_UTC_OFFSET 8
+#endif
+
 extern void InitializeOttoController(const HardwareConfig& hw_config);
 
 // ============================================================
@@ -414,7 +421,7 @@ private:
     // 峰值电流从 6 个同时启动降到 1 个，避免上电冲击把板子拖重启。
     // ============================================================
     static void BootHomeTask(void* arg) {
-        OttoRobot* self = static_cast<OttoRobot*>(arg);
+        (void)arg;  // 舵机归位走全局 C 接口，不需要 this
         // 只让出 200ms：背光已在 LCD 初始化后立刻点亮，
         // 舵机要在画面出来之后再逐个动，用户看到的是"开机 → 然后舵机归位"
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -852,7 +859,7 @@ private:
         // 3. 舵机归位 → 逐个下电。这一步在独立任务里做，
         //    因为它要等约 2.5 秒，不能卡住 MCP 调用线程（否则语音回话都播不出来）
         xTaskCreate([](void* arg) {
-            OttoRobot* self = static_cast<OttoRobot*>(arg);
+            (void)arg;  // 下电走全局 C 接口，不需要 this
             // 等关机提示音播完再动舵机，声音不会被舵机电流噪声盖住
             vTaskDelay(pdMS_TO_TICKS(600));
             OttoController_Sleep();      // 内部：归位 → 逐个 detach → LEDC 保持电流归零
