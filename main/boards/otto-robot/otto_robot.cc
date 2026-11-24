@@ -400,8 +400,9 @@ private:
     // ============================================================
     static void BootHomeTask(void* arg) {
         OttoRobot* self = static_cast<OttoRobot*>(arg);
-        // 等电源与 Wi-Fi/音频初始化大致完成，避开启动期最忙的窗口
-        vTaskDelay(pdMS_TO_TICKS(800));
+        // 只让出 200ms：背光已在 LCD 初始化后立刻点亮，
+        // 舵机要在画面出来之后再逐个动，用户看到的是"开机 → 然后舵机归位"
+        vTaskDelay(pdMS_TO_TICKS(200));
         OttoController_BootHomeSequence();
         ESP_LOGI(TAG, "开机舵机逐位归位完成");
         vTaskDelete(NULL);
@@ -456,6 +457,7 @@ public:
         OttoController_Wakeup();
 
         // 4. 播一声提示，明确告诉用户已经开机
+        // 唤醒用内置提示音即可（不需要说话，避免又被模型接一句）
         Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
         ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电");
     }
@@ -496,8 +498,16 @@ private:
             display_->SetChatMessage("system", alarm_name_.empty() ? "时间到了" : alarm_name_.c_str());
         }
 
-        // 先说话，间隔 700ms 再抬手，避免"声音和动作抢同一时刻"显得机械
+        // ★ 闹钟播报入口 ★
+        // 当前用内置提示音 OGG_WELCOME 占位。要念出"主人，时间到了"，
+        // 把这行换成框架的 TTS 接口即可，例如：
+        //     Application::GetInstance().Speak("主人，时间到了");
+        // （框架头文件里 TTS 方法的真实名字，用这条命令查：
+        //   grep -n "Speak\|PlayTts\|Say(" application.h ）
+        // 注意：不要用 MCP 返回值让模型来说，模型会自行加"好的，我的朋友"之类的话。
         Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
+
+        // 先出声，间隔 700ms 再抬手，避免"声音和动作抢同一时刻"显得机械
         vTaskDelay(pdMS_TO_TICKS(700));
         OttoController_GentleWave();
     }
@@ -596,7 +606,7 @@ private:
                 esp_timer_start_once(alarm_timer_, (uint64_t)seconds * 1000000ULL);
 
                 ESP_LOGI(TAG, "闹钟已设置: %d 秒后 -> %s", seconds, alarm_name_.c_str());
-                return ReturnValue("闹钟设置成功，到点会语音提醒三遍并招手");
+                return ReturnValue("");   // 空返回：不让模型复述，避免多出一句"好的，我的朋友"
             });
 
         // 2. 关机：语音回复后舵机归位下电、屏幕关闭，仅保留语音唤醒
@@ -607,9 +617,10 @@ private:
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
                 // 先把回话播出去，再走关机序列（序列内部会等语音播完再断舵机电）
-                Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
                 EnterSoftShutdown();
-                return ReturnValue("好的主人，我关机了");
+                // 空返回：不回传任何文本给模型，否则模型会自行复述成
+                // "好的，我的朋友"这类多余的话。关机提示音由 EnterSoftShutdown 内部播放。
+                return ReturnValue("");
             });
     }
 
@@ -746,19 +757,30 @@ public:
             hw_config_ = NON_CAMERA_VERSION_CONFIG;
         }
 
+        // ===== 屏幕优先：先让画面出来，再干别的 =====
+        // DetectCamera() 要逐个探 I2C 地址、还带 100ms 级复位延时，
+        // 是启动期最慢的一段。原先它排在屏幕点亮之前，所以白屏很久。
+        // 现在把它整体挪到背光亮起之后，屏幕能提前几百毫秒出图。
+        InitializeSpi();
+        InitializeLcdDisplay();
+        ws_control_server_ = nullptr;
+        GetBacklight()->RestoreBrightness();   // ← 背光在这里就亮，不等后面的慢活
+
+        // 【优化 1】舵机归位任务紧接着创建，等 200ms 就逐个动，
+        // 用户看到的是"开机 → 舵机归位"，而不是"白屏 → 舵机归位 → 出图"
+        xTaskCreate(BootHomeTask, "otto_boot", 3072, this, 3, nullptr);
+
+        InitializeButtons();
+        InitializePowerManager();
+        InitializeAudioCodec();
+
+        // ===== 慢活全部放到屏幕亮起之后 =====
         if (is_camera_board_) {
             has_camera_ = DetectCamera();
             if (!has_camera_) {
                 ESP_LOGW(TAG, "摄像头版未检测到摄像头，将跳过摄像头初始化");
             }
         }
-
-        InitializeSpi();
-        InitializeLcdDisplay();
-        InitializeButtons();
-        InitializePowerManager();
-        InitializeAudioCodec();
-
         if (has_camera_) {
             if (!InitializeCamera()) {
                 has_camera_ = false;
@@ -768,12 +790,6 @@ public:
         // 先建舵机控制器（注册动作类 MCP 工具），再注册闹钟/关机工具
         InitializeOttoController();
         InitializeCustomMcpTools();
-
-        ws_control_server_ = nullptr;
-        GetBacklight()->RestoreBrightness();
-
-        // 【优化 1】开机舵机逐位归位，放到独立任务里做，绝不阻塞启动流程
-        xTaskCreate(BootHomeTask, "otto_boot", 3072, this, 3, nullptr);
     }
 
     virtual AudioCodec* GetAudioCodec() override { return audio_codec_; }
