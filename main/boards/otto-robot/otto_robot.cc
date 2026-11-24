@@ -582,14 +582,14 @@ private:
         // "你好呀，我的朋友"是这么来的：原先靠 MCP 返回值 / 模型自由发挥来报时，
         // 模型拿到"闹钟到了"就会自己补一句客套话。现在板子直接播固定话术，
         // 语音链路不唤醒，模型没有插话的机会。
-        // 设了闹钟名 -> "主人，吃药"；没设 -> "主人，时间到了"
-        char buf[96];
-        snprintf(buf, sizeof(buf), "主人 时间到了", alarm_name_.empty() ? "时间到了" : alarm_name_.c_str());
+        // 无论闹钟名填什么，都只播这一句
+        
+        const std::string msg = "主人，时间到了";   // 固定话术，与闹钟名无关
         if (display_ != nullptr) {
             display_->SetEmotion("excited");
-            display_->SetChatMessage("system", buf);
+            display_->SetChatMessage("system", msg.c_str());
         }
-        ESP_LOGI(TAG, "闹钟播报: %s", buf);
+        ESP_LOGI(TAG, "闹钟播报: %s", msg.c_str());
         Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
 
         // 先出声，间隔 700ms 再抬手，避免"声音和动作抢同一时刻"显得机械
