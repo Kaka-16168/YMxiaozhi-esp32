@@ -27,6 +27,7 @@ private:
     QueueHandle_t action_queue_;
     bool has_hands_ = false;
     bool is_action_in_progress_ = false;
+    bool is_asleep_ = false;            // 软关机下电标志（DetachServos 之后为 true）
 
     struct OttoActionParams {
         int action_type;
@@ -67,6 +68,10 @@ private:
         ACTION_SERVO_SEQUENCE = 18,  // 舵机序列（自编程）
         ACTION_WHIRLWIND_LEG = 19    // 旋风腿
     };
+
+    // 开机逐舵机归位时，相邻两个舵机之间的间隔。
+    // 180ms 足够让单个舵机的启动电流峰值过去，6 个舵机总耗时约 1.1 秒。
+    static constexpr int kBootStaggerMs = 180;
 
     static void ActionTask(void* arg) {
         OttoController* controller = static_cast<OttoController*>(arg);
@@ -424,6 +429,44 @@ private:
         }
     }
 
+    // 【优化1】开机逐个舵机上电归位，避免浪涌电流把系统拉复位
+    // 顺序：左腿 → 右腿 → 左脚 → 右脚 → 左手 → 右手，每只间隔 180ms
+    void BootUpSequence() {
+        ESP_LOGI(TAG, "开机逐只舵机上电归位开始");
+
+        // 先把动作任务拉起来，否则队列里的动作没人执行
+        StartActionTaskIfNeeded();
+
+        // 逐只上电：直接对单个舵机写中立角，不等 Home 一次性全动
+        // 用 ServoMoveSingle（若 Otto 未暴露该接口，见文件末尾说明改用 MoveServos）
+        const int kBootDelayMs = 180;
+        const int kNeutral = 90;
+
+        // 腿脚先归位（支撑结构先稳住），手部最后
+        BootOneServo(LEFT_LEG,   kNeutral, 1200, kBootDelayMs);
+        BootOneServo(RIGHT_LEG,  kNeutral, 1200, kBootDelayMs);
+        BootOneServo(LEFT_FOOT,  kNeutral, 1200, kBootDelayMs);
+        BootOneServo(RIGHT_FOOT, kNeutral, 1200, kBootDelayMs);
+        if (has_hands_) {
+            BootOneServo(LEFT_HAND,  45, 1200, kBootDelayMs);   // 手部中立不是 90
+            BootOneServo(RIGHT_HAND, 180 - 45, 1200, kBootDelayMs);
+        }
+
+        // 全部上电完成后再发一次整体验证归位（带上微调值），确保姿态一致
+        QueueAction(ACTION_HOME, 1, 1200, 1, 0);
+        ESP_LOGI(TAG, "开机逐只舵机上电归位完成");
+    }
+
+    // 单只舵机缓慢转到目标角度
+    void BootOneServo(int servo_index, int target_angle, int speed_ms, int settle_ms) {
+        int targets[SERVO_COUNT];
+        // 读回当前位置作为基准，未指定的舵机保持不动
+        for (int i = 0; i < SERVO_COUNT; i++) targets[i] = 90;
+        targets[servo_index] = target_angle;
+        otto_.MoveServos(speed_ms, targets);
+        vTaskDelay(pdMS_TO_TICKS(settle_ms));
+    }
+
     void StartActionTaskIfNeeded() {
         if (action_task_handle_ == nullptr) {
             xTaskCreate(ActionTask, "otto_action", 1024 * 3, this, configMAX_PRIORITIES - 1,
@@ -521,7 +564,10 @@ public:
 
         action_queue_ = xQueueCreate(10, sizeof(OttoActionParams));
 
-        QueueAction(ACTION_HOME, 1, 1000, 1, 0);  // direction=1表示复位手部
+        // 【优化1】开机不再一次性 QueueAction(HOME)：
+        // 6 个舵机同时上电会产生很大的浪涌电流，容易把 5V 拉塌导致 MCU 复位卡死。
+        // 改成逐只上电 + 逐个归位，每只间隔 180ms，把电流峰值摊开。
+        BootUpSequence();
 
         RegisterMcpTools();
     }
@@ -532,6 +578,119 @@ public:
         QueueAction(ACTION_HOME, 1, 1000, 1, 0);
         ESP_LOGI(TAG, "已请求 Otto 归位到中立姿态");
     }
+
+    // ======== 新增：温柔招手（闹钟互动用）========
+    // 幅度压小、速度放慢，只动手部舵机，腿脚全部锁在 90 度不动，站得稳也不吓人。
+    // direction: 1=右手主导，-1=左手主导
+    void RequestGentleWave(int direction) {
+        if (!has_hands_) {
+            ESP_LOGW(TAG, "无手部舵机，温柔招手降级为原地轻晃");
+            // 没有手就只做一个极小幅度的身体轻晃，不做大幅动作
+            QueueAction(ACTION_SWING, 2, 1600, 0, 12);
+            return;
+        }
+        if (direction == 0) direction = 1;
+        // steps=2 只摆两个来回，speed=1500 慢速，amount=35 小幅度
+        QueueAction(ACTION_GREETING, 2, 1500, direction, 0);
+    }
+
+    // ======== 新增：舵机下电（省电用）========
+    // 归位完成后调用， detach 全部舵机，去掉保持电流。
+    // 注意：必须在 ActionTask 已经把 Home 执行完之后调用，否则会把正在跑的动作掐断。
+    void Sleep() {
+        // 只 detach 舵机，**不销毁 ActionTask、不重建 action_queue_**：
+        // 队列和任务在构造函数里创建一次并长期存活，中途 vTaskDelete + xQueueCreate
+        // 会让仍在跑的 ActionTask 拿到已销毁的队列句柄（野指针）。
+        // 这里改为清空队列 + 置睡眠标志，ActionTask 照常空转等待，唤醒即可用。
+        xQueueReset(action_queue_);
+        is_action_in_progress_ = false;
+        is_asleep_ = true;
+
+        // DetachServos()：Otto 库真实的批量下电接口，释放全部 LEDC 通道，
+        // 舵机保持电流归零 —— 这是软关机省电的关键一步。
+        otto_.DetachServos();
+        otto_.SetRestState(false);                    // 已下电，不再是 resting 姿态
+        ESP_LOGI(TAG, "舵机已下电（DetachServos），保持电流归零");
+    }
+
+    // ======== 新增：唤醒后重新上电并归位 ========
+    // Sleep() 之后必须调用一次，让 LEDC 通道重新接管舵机。
+    void Wakeup() {
+        if (!is_asleep_) {
+            // 没睡过（比如只是黑屏后喊唤醒），直接补一次归位即可
+            QueueAction(ACTION_HOME, 1, 1000, 1, 0);
+            return;
+        }
+        is_asleep_ = false;
+
+        // AttachServos() 重新接管通道。注意：attach 瞬间舵机没有目标位置，
+        // 会先自己弹到当前 PWM 对应的角度，可能轻微一抖，属正常现象。
+        otto_.AttachServos();
+        StartActionTaskIfNeeded();                    // 幂等，任务还在时什么都不做
+        QueueAction(ACTION_HOME, 1, 1200, 1, 0);      // 上电慢速归位，避免猛地一抖
+        ESP_LOGI(TAG, "舵机重新上电，已入队归位动作");
+    }
+
+    // 是否有手部舵机（otto_robot.cc 决定招手方式时用）
+    bool HasHands() const { return has_hands_; }
+
+    // ======== 【优化 1】开机逐舵机归位 ===========
+    // 不使用动作队列：启动阶段 ActionTask 还没起来，也不会被别的动作插队。
+    // 每个舵机单独 attach + 单独走到中位，间隔 kBootStaggerMs，
+    // 让浪涌电流一次只落在一个舵机上。
+    void BootHomeSequence() {
+        static const char* kNames[SERVO_COUNT] = {"左腿", "右腿", "左脚", "右脚", "左手", "右手"};
+        // 中立位：腿脚 90 度；手部按 Otto 库的惯例（左手 45 / 右手 135，见 ActionTask 初值）
+        static const int   kHomeAngle[SERVO_COUNT] = {90, 90, 90, 90, 45, 180 - 45};
+
+        ESP_LOGI(TAG, "开机舵机逐位归位开始（间隔 %dms）", kBootStaggerMs);
+
+        // 一次性 attach 全部通道：AttachServos() 是 Otto 库唯一的 attach 入口，
+        // 内部按 has_hands_ 决定接 4 路还是 6 路，NC 引脚不会被动到。
+        // 浪涌控制不靠"延迟 attach"，而靠下面逐个 MoveSingle 错峰驱动——
+        // 舵机真正吃电流的是转到目标角的那一刻，attach 本身几乎不耗电。
+        otto_.AttachServos();
+
+        int moved = 0;
+        for (int i = 0; i < SERVO_COUNT; i++) {
+            // 手部舵机未配置时跳过，避免驱动 NC 引脚
+            if ((i == LEFT_HAND || i == RIGHT_HAND) && !has_hands_) {
+                continue;
+            }
+            // MoveSingle(position, servo_number)：库里唯一的单舵机直驱接口，
+            // 一次只让一个舵机转动，把启动电流峰值限制在单个舵机范围内。
+            otto_.MoveSingle(kHomeAngle[i], i);
+            ESP_LOGI(TAG, "  [%d/%d] %s -> %d 度", ++moved, has_hands_ ? 6 : 4,
+                     kNames[i], kHomeAngle[i]);
+            vTaskDelay(pdMS_TO_TICKS(kBootStaggerMs));
+        }
+
+        // 与 Otto 库内部的 resting 状态对齐，否则后续 Home() 可能判断成
+        // "已在 rests 状态"而直接跳过，导致姿态和实际位置脱节。
+        otto_.SetRestState(true);
+
+        vTaskDelay(pdMS_TO_TICKS(150));               // 等最后一个舵机到位再放手
+        ESP_LOGI(TAG, "开机舵机逐位归位结束");
+    }
+
+    // ======== 【优化 2】温柔招手 ===========
+    // 有手：单次小幅度慢速挥手；无手：极小幅度身体轻晃（不会报错）
+    void GentleWave() {
+        RequestGentleWave(1);
+    }
+
+    // ======== 状态与队列控制 ===========
+    bool IsBusy() const { return is_action_in_progress_; }
+
+    // 丢掉排队中还没执行的动作（闹钟连播被打断时用，避免攒着一股脑补播）
+    void ClearActionQueue() {
+        if (action_queue_ != nullptr) {
+            xQueueReset(action_queue_);
+        }
+    }
+
+    // 舵机是否已下电（背光恢复需要等归位完成，靠这个判断）
+    bool IsAsleep() const { return is_asleep_; }
 
     void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
@@ -724,8 +883,29 @@ public:
                                PowerManager::ResumeBatteryUpdate();  // 停止动作时恢复电量更新
                                xQueueReset(action_queue_);
 
+                               // 任务已删，必须先重建再入队，否则动作永远不执行
+                               StartActionTaskIfNeeded();
                                QueueAction(ACTION_HOME, 1, 1000, 1, 0);
                                return true;
+                           });
+
+        // 【优化3】舵机下电： extremity 归位后 detach，去掉保持电流
+        mcp_server.AddTool("self.otto.sleep",
+                           "舵机下电省电。先归位到中立姿态，再关闭全部舵机 PWM 输出，"
+                           "消除保持电流。下电后需调用 self.otto.wake 才能再次动作。",
+                           PropertyList(),
+                           [this](const PropertyList& properties) -> ReturnValue {
+                               QueueAction(ACTION_HOME, 1, 1000, 1, 0);
+                               Sleep();
+                               return "舵机已归位并下电";
+                           });
+
+        mcp_server.AddTool("self.otto.wake",
+                           "舵机重新上电。从 sleep 状态恢复，重新 attach 并归位。",
+                           PropertyList(),
+                           [this](const PropertyList& properties) -> ReturnValue {
+                               Wakeup();
+                               return "舵机已重新上电并归位";
                            });
 
         mcp_server.AddTool(
@@ -872,4 +1052,72 @@ extern "C" void OttoController_RequestHome(void) {
     } else {
         ESP_LOGW(TAG, "OttoController 尚未初始化，无法归位");
     }
+}
+
+// ================================================================
+// 【优化 1】开机：6 个舵机逐个 attach + 逐个拉到中位
+// 一次只动一个舵机，每个之间留 180ms，把上电浪涌电流从
+// "6 个同时启动"降到"1 个启动"，避免电源被拉垮导致板子重启卡死。
+// 全程在调用者自己的任务里跑（otto_robot.cc 的 BootHomeTask），
+// 不占用 ActionTask，也不会和动作队列抢 LEDC 通道。
+// ================================================================
+extern "C" void OttoController_BootHomeSequence(void) {
+    if (g_otto_controller == nullptr) {
+        ESP_LOGE(TAG, "BootHomeSequence: 控制器未初始化");
+        return;
+    }
+    g_otto_controller->BootHomeSequence();
+}
+
+// ================================================================
+// 【优化 2】温柔招手：幅度小、速度慢的单次挥手
+// 无手部舵机时自动退化为身体轻摇，调用方无需判断。
+// ================================================================
+extern "C" void OttoController_GentleWave(void) {
+    if (g_otto_controller == nullptr) {
+        ESP_LOGE(TAG, "GentleWave: 控制器未初始化");
+        return;
+    }
+    g_otto_controller->GentleWave();
+}
+
+// ================================================================
+// 【优化 3】软关机：归位 → 逐个 detach 下电（保持电流归零）
+// ================================================================
+extern "C" void OttoController_Sleep(void) {
+    if (g_otto_controller == nullptr) {
+        ESP_LOGE(TAG, "Sleep: 控制器未初始化");
+        return;
+    }
+    g_otto_controller->Sleep();
+}
+
+// ================================================================
+// 【优化 3】唤醒：重新 attach 全部舵机并慢速归位
+// ================================================================
+extern "C" void OttoController_Wakeup(void) {
+    if (g_otto_controller == nullptr) {
+        ESP_LOGE(TAG, "Wakeup: 控制器未初始化");
+        return;
+    }
+    g_otto_controller->Wakeup();
+}
+
+// ================================================================
+// 状态查询 / 队列清理（闹钟打断用）
+// ================================================================
+extern "C" bool OttoController_IsBusy(void) {
+    return (g_otto_controller != nullptr) ? g_otto_controller->IsBusy() : false;
+}
+
+extern "C" void OttoController_ClearQueue(void) {
+    if (g_otto_controller != nullptr) {
+        g_otto_controller->ClearActionQueue();
+    }
+}
+// ================================================================
+// 睡眠状态查询：otto_robot.cc 判断"是否需要亮屏 + 上电"用
+// ================================================================
+extern "C" bool OttoController_IsAsleep(void) {
+    return (g_otto_controller == nullptr) ? true : g_otto_controller->IsAsleep();
 }
