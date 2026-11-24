@@ -1,17 +1,12 @@
-#include <driver/i2c_master.h>
-#include <driver/ledc.h>
-#include <driver/spi_common.h>
-#include <esp_lcd_panel_io.h>
-#include <esp_lcd_panel_ops.h>
-#include <esp_lcd_panel_vendor.h>
-#include <esp_log.h>
-#include <esp_rom_sys.h>
-#include <esp_timer.h>
-#include <sys/time.h>
-#include <time.h>
-#include <string>
+#include "otto_emoji_display.h"
 
-#include <new>
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <cstring>
+#include <string>
 
 #include "application.h"
 #include "button.h"
@@ -22,7 +17,6 @@
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
-#include "otto_emoji_display.h"
 #include "power_manager.h"
 #include "system_reset.h"
 #include "websocket_control_server.h"
@@ -30,13 +24,6 @@
 #include "assets/lang_config.h"
 
 #define TAG "OttoRobot"
-
-// 本地时区相对 UTC 的偏移（小时）。东八区填 8；ClockTimeStr / ClockDateStr
-// 用它把 SNTP 校准后的 UTC 秒换算成本地时间。用 #ifndef 包裹，避免与其它
-// 头文件里的同名宏重复定义。
-#ifndef TIME_ZONE_UTC_OFFSET
-#define TIME_ZONE_UTC_OFFSET 8
-#endif
 
 extern void InitializeOttoController(const HardwareConfig& hw_config);
 
@@ -60,17 +47,17 @@ void OttoController_ClearQueue(void);
 
 class OttoRobot : public WifiBoard {
 private:
-    LcdDisplay* display_;
-    PowerManager* power_manager_;
+    LcdDisplay* display_ = nullptr;
+    PowerManager* power_manager_ = nullptr;
     Button boot_button_;
-    WebSocketControlServer* ws_control_server_;
+    WebSocketControlServer* ws_control_server_ = nullptr;
     HardwareConfig hw_config_;
-    AudioCodec* audio_codec_;
-    i2c_master_bus_handle_t i2c_bus_;
-    Camera* camera_;
-    bool is_camera_board_;
-    bool has_camera_;
-    OttoCameraType camera_type_;
+    AudioCodec* audio_codec_ = nullptr;
+    i2c_master_bus_handle_t i2c_bus_ = nullptr;
+    Camera* camera_ = nullptr;
+    bool is_camera_board_ = false;
+    bool has_camera_ = false;
+    OttoCameraType camera_type_ = OTTO_CAMERA_NONE;
 
     // ======== 闹钟相关 ========
     esp_timer_handle_t alarm_timer_ = nullptr;      // 到点定时器（单次）
@@ -80,14 +67,13 @@ private:
     bool alarm_active_ = false; // 闹钟是否处于播报中
     bool screen_off_ = false;   // 屏幕是否处于软关机黑屏态
 
-    // ======== 待机时钟 ========
-    esp_timer_handle_t clock_timer_ = nullptr;  // 1 秒节拍
-    int  idle_sec_ = 0;        // 距上次交互的秒数
-    bool clock_on_ = false;    // 是否处于时钟显示态
-    bool clock_dim_ = false;   // 时钟态下是否已关背光（省电）
-    int64_t time_base_us_ = 0; // SNTP 校准时刻的 esp_timer 计数
-    time_t  time_base_t_ = 0;  // SNTP 校准时刻的 UTC 秒
-    bool    time_valid_ = false;
+    // ======== 开机阶段 ========
+    // kBootEarly   : 构造函数阶段，只把屏幕点起来
+    // kBootUiUp    : 首帧已上屏，可以开始做重活（音频/摄像头/舵机）
+    // kBootSettled : 全部就绪，舵机逐个归位
+    enum BootPhase { kBootEarly, kBootUiUp, kBootSettled };
+    BootPhase boot_phase_ = kBootEarly;
+    int       boot_wait_ms_ = 0;
 
     // OV2640 有两个可能的 PID，抽成小函数避免长条件写错
     static bool pid_is_ov2640(uint16_t pid) {
@@ -95,277 +81,63 @@ private:
     }
 
     // ------------------------------------------------------------
-    // 硬件识别
+    // 屏幕
     // ------------------------------------------------------------
-    bool DetectHardwareVersion() {
-        constexpr gpio_num_t kDetectGpio15 = GPIO_NUM_15;
-        constexpr gpio_num_t kDetectGpio16 = GPIO_NUM_16;
-        constexpr int kStableSampleCount = 8;
-        constexpr uint32_t kSettleTimeUs = 5000;
-        constexpr uint32_t kSampleIntervalUs = 1000;
-
-        gpio_config_t detect_config = {
-            .pin_bit_mask = (1ULL << kDetectGpio15) | (1ULL << kDetectGpio16),
-            .mode = GPIO_MODE_INPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_ENABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        esp_err_t ret = gpio_config(&detect_config);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "板型识别 GPIO 初始化失败: %s", esp_err_to_name(ret));
-            return false;
+    void TurnScreenOff() {
+        screen_off_ = true;
+        if (GetBacklight() != nullptr) {
+            GetBacklight()->SetBrightness(0);
         }
-
-        esp_rom_delay_us(kSettleTimeUs);
-        for (int sample = 0; sample < kStableSampleCount; ++sample) {
-            int gpio15_level = gpio_get_level(kDetectGpio15);
-            int gpio16_level = gpio_get_level(kDetectGpio16);
-            if (gpio15_level == 0 || gpio16_level == 0) {
-                ESP_LOGI(TAG, "板型识别: GPIO15=%d GPIO16=%d，判定为无摄像头版", gpio15_level,
-                         gpio16_level);
-                return false;
-            }
-            if (sample + 1 < kStableSampleCount) {
-                esp_rom_delay_us(kSampleIntervalUs);
-            }
+        if (display_ != nullptr) {
+            display_->SetChatMessage("system", "");
         }
-
-        ESP_LOGI(TAG, "板型识别: GPIO15/GPIO16 稳定为高，判定为摄像头版");
-        return true;
     }
 
-    bool DetectGc2145Camera(uint16_t& detected_pid) {
-        i2c_device_config_t dev_cfg = {
-            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-            .device_address = OTTO_GC2145_SCCB_ADDR,
-            .scl_speed_hz = 100000,
-        };
-        i2c_master_dev_handle_t dev_handle = nullptr;
-        if (i2c_master_bus_add_device(i2c_bus_, &dev_cfg, &dev_handle) != ESP_OK) {
-            return false;
+    void TurnScreenOn() {
+        screen_off_ = false;
+        if (GetBacklight() != nullptr) {
+            GetBacklight()->RestoreBrightness();
         }
-
-        // GC2145 在异常状态下可能不响应 SCCB，先软复位（0xfe bit7），再切到 page 0。
-        uint8_t reset_cmd[2] = {0xFE, 0x80};
-        if (i2c_master_transmit(dev_handle, reset_cmd, sizeof(reset_cmd), 200) == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-
-        uint8_t page0_cmd[2] = {0xFE, 0x00};
-        bool found = false;
-        if (i2c_master_transmit(dev_handle, page0_cmd, sizeof(page0_cmd), 200) == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-
-            const uint8_t reg_high = 0xF0;
-            const uint8_t reg_low = 0xF1;
-            uint8_t pid_high = 0;
-            uint8_t pid_low = 0;
-            if (i2c_master_transmit_receive(dev_handle, &reg_high, 1, &pid_high, 1, 200) ==
-                    ESP_OK &&
-                i2c_master_transmit_receive(dev_handle, &reg_low, 1, &pid_low, 1, 200) == ESP_OK) {
-                uint16_t pid = (pid_high << 8) | pid_low;
-                ESP_LOGD(TAG, "GC2145 探测 PID=0x%04X", pid);
-                if (pid == OTTO_GC2145_PID) {
-                    detected_pid = pid;
-                    found = true;
-                }
-            }
-        }
-
-        i2c_master_bus_rm_device(dev_handle);
-        return found;
-    }
-
-    bool DetectCamera() {
-        ledc_timer_config_t ledc_timer = {
-            .speed_mode = LEDC_LOW_SPEED_MODE,
-            .duty_resolution = LEDC_TIMER_2_BIT,
-            .timer_num = LEDC_TIMER,
-            .freq_hz = CAMERA_XCLK_FREQ,
-            .clk_cfg = LEDC_AUTO_CLK,
-        };
-        esp_err_t ret = ledc_timer_config(&ledc_timer);
-        if (ret != ESP_OK) {
-            return false;
-        }
-
-        ledc_channel_config_t ledc_channel = {
-            .gpio_num = CAMERA_XCLK,
-            .speed_mode = LEDC_LOW_SPEED_MODE,
-            .channel = LEDC_CHANNEL,
-            .intr_type = LEDC_INTR_DISABLE,
-            .timer_sel = LEDC_TIMER,
-            .duty = 2,
-            .hpoint = 0,
-        };
-        ret = ledc_channel_config(&ledc_channel);
-        if (ret != ESP_OK) {
-            return false;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-        i2c_master_bus_config_t i2c_bus_cfg = {
-            .i2c_port = I2C_NUM_0,
-            .sda_io_num = CAMERA_VERSION_CONFIG.i2c_sda_pin,
-            .scl_io_num = CAMERA_VERSION_CONFIG.i2c_scl_pin,
-            .clk_source = I2C_CLK_SRC_DEFAULT,
-            .glitch_ignore_cnt = 7,
-            .intr_priority = 0,
-            .trans_queue_depth = 0,
-            .flags =
-                {
-                    .enable_internal_pullup = 1,
-                },
-        };
-
-        ret = i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_);
-        if (ret != ESP_OK) {
-            ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL, 0);
-            return false;
-        }
-
-        const uint8_t camera_addresses[] = {0x30, 0x3C, 0x21, 0x60};
-        bool camera_found = false;
-        bool unknown_camera_found = false;
-        uint16_t detected_pid = 0;
-        uint16_t unknown_pid = 0;
-
-        for (size_t i = 0; i < sizeof(camera_addresses); i++) {
-            uint8_t addr = camera_addresses[i];
-            i2c_device_config_t dev_cfg = {
-                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-                .device_address = addr,
-                .scl_speed_hz = 100000,
-            };
-
-            i2c_master_dev_handle_t dev_handle;
-            ret = i2c_master_bus_add_device(i2c_bus_, &dev_cfg, &dev_handle);
-            if (ret == ESP_OK) {
-                uint8_t data[2] = {0, 0};
-
-                uint8_t reg_addr_8bit = 0x0A;
-                ret = i2c_master_transmit_receive(dev_handle, &reg_addr_8bit, 1, data, 2, 200);
-                if (ret == ESP_OK && (data[0] != 0 || data[1] != 0)) {
-                    uint16_t pid = (data[0] << 8) | data[1];
-                    if (pid == OTTO_OV2640_PID_1 || pid == OTTO_OV2640_PID_2) {
-                        detected_pid = pid;
-                        ESP_LOGI(TAG, "检测到摄像头 (OV2640方式) PID=0x%04X (地址=0x%02X)",
-                                 detected_pid, addr);
-                        camera_found = true;
-                        i2c_master_bus_rm_device(dev_handle);
-                        break;
-                    }
-                    unknown_pid = pid;
-                    unknown_camera_found = true;
-                }
-
-                uint8_t reg_addr_high[2] = {0x30, 0x0A};
-                uint8_t reg_addr_low[2] = {0x30, 0x0B};
-                uint8_t pid_high = 0, pid_low = 0;
-
-                ret = i2c_master_transmit_receive(dev_handle, reg_addr_high, 2, &pid_high, 1, 200);
-                if (ret == ESP_OK) {
-                    ret =
-                        i2c_master_transmit_receive(dev_handle, reg_addr_low, 2, &pid_low, 1, 200);
-                    if (ret == ESP_OK) {
-                        uint16_t pid = (pid_high << 8) | pid_low;
-                        if (pid != 0) {
-                            if (pid == OTTO_OV3660_PID) {
-                                detected_pid = pid;
-                                ESP_LOGI(TAG, "检测到摄像头 (OV3660方式) PID=0x%04X (地址=0x%02X)",
-                                         detected_pid, addr);
-                                camera_found = true;
-                                i2c_master_bus_rm_device(dev_handle);
-                                break;
-                            }
-                            unknown_pid = pid;
-                            unknown_camera_found = true;
-                        }
-                    }
-                }
-
-                i2c_master_bus_rm_device(dev_handle);
-            }
-        }
-
-        // OV2640/OV3660 与 GC2145 的寄存器协议不同，先按各自方式探测；
-        // 只有都没命中时才尝试 GC2145，避免软复位干扰已经识别到的 OV 传感器。
-        if (!camera_found) {
-            uint16_t gc2145_pid = 0;
-            if (DetectGc2145Camera(gc2145_pid)) {
-                detected_pid = gc2145_pid;
-                camera_found = true;
-                ESP_LOGI(TAG, "检测到摄像头 (GC2145方式) PID=0x%04X", detected_pid);
-            } else if (unknown_camera_found) {
-                detected_pid = unknown_pid;
-                camera_found = true;
-                ESP_LOGW(TAG, "摄像头 PID 未识别，按未知型号继续初始化: PID=0x%04X", detected_pid);
-            }
-        }
-
-        if (!camera_found) {
-            i2c_del_master_bus(i2c_bus_);
-            i2c_bus_ = nullptr;
-            ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL, 0);
-            camera_type_ = OTTO_CAMERA_NONE;
-        } else {
-            if (pid_is_ov2640(detected_pid)) {   // OV2640 有两个可能的 PID
-                camera_type_ = OTTO_CAMERA_OV2640;
-                ESP_LOGI(TAG, "摄像头类型: OV2640 (PID=0x%04X)", detected_pid);
-            } else if (detected_pid == OTTO_OV3660_PID) {
-                camera_type_ = OTTO_CAMERA_OV3660;
-                ESP_LOGI(TAG, "摄像头类型: OV3660 (PID=0x%04X)", detected_pid);
-            } else if (detected_pid == OTTO_GC2145_PID) {
-                camera_type_ = OTTO_CAMERA_GC2145;
-                ESP_LOGI(TAG, "摄像头类型: GC2145 (PID=0x%04X)", detected_pid);
-            } else {
-                camera_type_ = OTTO_CAMERA_UNKNOWN;
-                ESP_LOGW(TAG, "未知摄像头类型，PID=0x%04X", detected_pid);
-            }
-        }
-        return camera_found;
     }
 
     // ------------------------------------------------------------
-    // 基础外设初始化
+    // SPI / LCD
     // ------------------------------------------------------------
-    void InitializePowerManager() {
-        power_manager_ = new PowerManager(hw_config_.power_charge_detect_pin,
-                                          hw_config_.power_adc_unit, hw_config_.power_adc_channel);
-    }
-
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
-        buscfg.mosi_io_num = hw_config_.display_mosi_pin;
+        buscfg.mosi_io_num = DISPLAY_MOSI_PIN;
         buscfg.miso_io_num = GPIO_NUM_NC;
-        buscfg.sclk_io_num = hw_config_.display_clk_pin;
+        buscfg.sclk_io_num = DISPLAY_CLK_PIN;
         buscfg.quadwp_io_num = GPIO_NUM_NC;
         buscfg.quadhd_io_num = GPIO_NUM_NC;
         buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
-        ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+        ESP_ERROR_CHECK(spi_bus_initialize(DISPLAY_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
 
     void InitializeLcdDisplay() {
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
+
         esp_lcd_panel_io_spi_config_t io_config = {};
-        io_config.cs_gpio_num = hw_config_.display_cs_pin;
-        io_config.dc_gpio_num = hw_config_.display_dc_pin;
-        io_config.spi_mode = DISPLAY_SPI_MODE;
-        io_config.pclk_hz = 20 * 1000 * 1000;
+        io_config.cs_gpio_num = DISPLAY_CS_PIN;
+        io_config.dc_gpio_num = DISPLAY_DC_PIN;
+        io_config.spi_mode = 0;
+        io_config.pclk_hz = 40 * 1000 * 1000;
         io_config.trans_queue_depth = 10;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
-        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &panel_io));
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(DISPLAY_SPI_HOST, &io_config, &panel_io));
 
         esp_lcd_panel_dev_config_t panel_config = {};
-        panel_config.reset_gpio_num = hw_config_.display_rst_pin;
-        panel_config.rgb_ele_order = DISPLAY_RGB_ORDER;
+        panel_config.reset_gpio_num = DISPLAY_RST_PIN;
         panel_config.bits_per_pixel = 16;
+        panel_config.color_space = ESP_LCD_COLOR_SPACE_RGB;
+
+        esp_lcd_panel_st7789_vendor_config_t vendor_config = {};
+        vendor_config.flags.use_qspi_interface = 0;
+        panel_config.vendor_config = &vendor_config;
 
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
-
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, DISPLAY_INVERT_COLOR);
@@ -379,10 +151,6 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
-            // 待机时钟态：任何按键先唤醒屏幕
-            if (ClockWake(true)) {
-                return;
-            }
             // 软关机黑屏时，按一下开机键等于唤醒
             if (screen_off_) {
                 WakeUpFromSoftShutdown();
@@ -397,305 +165,166 @@ private:
         });
     }
 
+    // ------------------------------------------------------------
+    // 音频
+    // ------------------------------------------------------------
     void InitializeAudioCodec() {
-        if (hw_config_.audio_use_simplex) {
-            audio_codec_ = new NoAudioCodecSimplex(
-                hw_config_.audio_input_sample_rate, hw_config_.audio_output_sample_rate,
-                hw_config_.audio_i2s_spk_gpio_bclk, hw_config_.audio_i2s_spk_gpio_lrck,
-                hw_config_.audio_i2s_spk_gpio_dout, hw_config_.audio_i2s_mic_gpio_sck,
-                hw_config_.audio_i2s_mic_gpio_ws, hw_config_.audio_i2s_mic_gpio_din);
-        } else {
-            audio_codec_ = new NoAudioCodecDuplex(
-                hw_config_.audio_input_sample_rate, hw_config_.audio_output_sample_rate,
-                hw_config_.audio_i2s_gpio_bclk, hw_config_.audio_i2s_gpio_ws,
-                hw_config_.audio_i2s_gpio_dout, hw_config_.audio_i2s_gpio_din);
-        }
+        int64_t t0 = esp_timer_get_time();
+        audio_codec_ = new NoAudioCodecDuplex(
+            AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,
+            AUDIO_I2S_GPIO_DIN, AUDIO_I2S_GPIO_DOUT,
+            AUDIO_I2S_GPIO_MCLK, AUDIO_SAMPLE_RATE, AUDIO_CODEC_BITS_PER_SAMPLE);
+        ESP_LOGI(TAG, "AudioCodec 初始化耗时 %lld ms", (esp_timer_get_time() - t0) / 1000);
     }
 
-    void InitializeOttoController() { ::InitializeOttoController(hw_config_); }
+    // ------------------------------------------------------------
+    // 摄像头（慢活，推迟到首帧之后）
+    // ------------------------------------------------------------
+    static bool CamProbe(esp_lcd_panel_io_handle_t io, uint16_t reg, uint16_t* pid) {
+        uint8_t hi = 0, lo = 0;
+        if (esp_lcd_panel_io_rx_param(io, (int)reg, &hi, 1) != ESP_OK) return false;
+        if (esp_lcd_panel_io_rx_param(io, (int)reg + 1, &lo, 1) != ESP_OK) return false;
+        *pid = (uint16_t)((hi << 8) | lo);
+        return true;
+    }
 
-    // ============================================================
-    // 【优化 1】开机逐舵机归位
-    // 由 otto_controller.cc 里的 OttoController_BootHomeSequence() 实现：
-    // 6 个舵机一个一个 attach + 拉到中位，每个间隔 180ms，
-    // 峰值电流从 6 个同时启动降到 1 个，避免上电冲击把板子拖重启。
-    // ============================================================
-    static void BootHomeTask(void* arg) {
-        (void)arg;  // 舵机归位走全局 C 接口，不需要 this
-        // 只让出 200ms：背光已在 LCD 初始化后立刻点亮，
-        // 舵机要在画面出来之后再逐个动，用户看到的是"开机 → 然后舵机归位"
-        vTaskDelay(pdMS_TO_TICKS(200));
-        OttoController_BootHomeSequence();
-        ESP_LOGI(TAG, "开机舵机逐位归位完成");
+    void DetectCamera() {
+        if (Camera::GetCameraConfigCount() == 0) {
+            ESP_LOGW(TAG, "未配置任何摄像头，跳过探测");
+            has_camera_ = false;
+            return;
+        }
+
+        const int sio_c = CAMERA_SIOD_PIN;
+        const int sio_d = CAMERA_SIOC_PIN;
+        i2c_master_bus_config_t i2c_cfg = {};
+        i2c_cfg.i2c_port = I2C_NUM_1;
+        i2c_cfg.sda_io_num = sio_d;
+        i2c_cfg.scl_io_num = sio_c;
+        i2c_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
+        i2c_cfg.glitch_ignore_cnt = 7;
+        i2c_cfg.flags.enable_internal_pullup = true;
+        if (i2c_new_master_bus(&i2c_cfg, &i2c_bus_) != ESP_OK) {
+            ESP_LOGE(TAG, "摄像头 I2C 总线创建失败");
+            has_camera_ = false;
+            return;
+        }
+
+        static const uint16_t kCandidates[] = {0x2640, 0x2642, 0x3660, 0x2145};
+        static const char*    kNames[]      = {"OV2640", "OV2640(alt)", "OV3660", "GC2145"};
+
+        for (size_t i = 0; i < sizeof(kCandidates) / sizeof(kCandidates[0]); i++) {
+            esp_lcd_panel_io_handle_t probe_io = nullptr;
+            esp_lcd_panel_io_i2c_config_t io_cfg = ESP_LCD_PANEL_IO_I2C_CONFIG(
+                kCandidates[i], nullptr, nullptr);
+            io_cfg.scl_speed_hz = 100000;
+            if (esp_lcd_new_panel_io_i2c(i2c_bus_, &io_cfg, &probe_io) != ESP_OK) continue;
+
+            uint16_t pid = 0;
+            bool ok = CamProbe(probe_io, 0x300A, &pid);
+            esp_lcd_panel_io_del(probe_io);
+
+            ESP_LOGI(TAG, "探测 0x%02X -> %s (PID=0x%04X)", kCandidates[i],
+                     ok ? "应答" : "无应答", pid);
+
+            if (ok && pid_is_ov2640(pid)) {
+                camera_type_ = OTTO_CAMERA_OV2640;
+                has_camera_  = true;
+                break;
+            }
+            if (ok && pid == 0x3660) {
+                camera_type_ = OTTO_CAMERA_OV3660;
+                has_camera_  = true;
+                break;
+            }
+            if (ok && pid == 0x2145) {
+                camera_type_ = OTTO_CAMERA_GC2145;
+                has_camera_  = true;
+                break;
+            }
+            // GC2145 的 PID 寄存器布局与 OV 不同，0x300A 读不到时按型号兜底
+            if (!ok && kCandidates[i] == 0x2145) {
+                camera_type_ = OTTO_CAMERA_GC2145;
+                has_camera_  = true;
+                break;
+            }
+            (void)kNames;
+        }
+
+        ESP_LOGI(TAG, "摄像头探测结果: %s", has_camera_ ? "已发现" : "未发现");
+    }
+
+    bool InitializeCamera() {
+        esp_cam_sensor_config_t cam_config{};
+        cam_config.scl_io_num = (gpio_num_t)CAMERA_SIOC_PIN;
+        cam_config.sda_io_num = (gpio_num_t)CAMERA_SIOD_PIN;
+        cam_config.detect_pixel_format = 0;
+        cam_config.fb_location = CAMERA_FB_IN_PSRAM;
+        cam_config.magnification = 0;
+
+        camera_ = new Esp32Camera(cam_config);
+        if (!camera_->Start()) {
+            ESP_LOGE(TAG, "摄像头启动失败");
+            delete camera_;
+            camera_ = nullptr;
+            return false;
+        }
+        ESP_LOGI(TAG, "摄像头启动成功");
+        return true;
+    }
+
+    // ------------------------------------------------------------
+    // 开机尾巴：首帧上屏之后再干重活
+    // ------------------------------------------------------------
+    static void BootFinishTask(void* arg) {
+        static_cast<OttoRobot*>(arg)->BootAdvance();
         vTaskDelete(NULL);
     }
 
-    // ============================================================
-    // 【优化 3】屏幕开关封装
-    // ============================================================
-    void TurnScreenOn() {
-        if (GetBacklight() != nullptr) {
-            GetBacklight()->RestoreBrightness();
-        }
-        screen_off_ = false;
-    }
-
-    void TurnScreenOff() {
-        if (display_ != nullptr) {
-            display_->SetChatMessage("system", "");
-            display_->SetEmotion("neutral");
-        }
-        if (GetBacklight() != nullptr) {
-            GetBacklight()->SetBrightness(0);
-        }
-        screen_off_ = true;
-    }
-
-    // ============================================================
-    // 【优化 3】唤醒：舵机重新上电 + 自动亮屏
-    // 软关机期间 MCU 和麦克风一直在跑，唤醒词照样能触发；
-    // 语音链路本身由 Application 处理，这里只负责"把灯打开、把舵机叫醒"。
-    // ============================================================
-public:
-    void WakeUpFromSoftShutdown() {
-        if (!screen_off_) {
-            return;  // 本来就是醒的，别重复上电
-        }
-        ESP_LOGI(TAG, "从软关机唤醒");
-        ClockWake(false);   // 先把待机时钟状态清掉
-
-        // 1. 若闹钟正在播报，唤醒视为"知道了"，直接收尾
-        if (alarm_active_) {
-            StopAlarmSequence(true);
-        }
-
-        // 2. 屏幕先亮，让用户立刻看到反馈
-        TurnScreenOn();
-        if (display_ != nullptr) {
-            display_->SetEmotion("happy");
-            display_->SetChatMessage("system", "我在");
-        }
-
-        // 3. 舵机重新上电并慢速归位（内部自己做，不阻塞这里）
-        OttoController_Wakeup();
-
-        // 4. 播一声提示，明确告诉用户已经开机
-        // 唤醒用内置提示音即可（不需要说话，避免又被模型接一句）
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
-        ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电");
-    }
-
-private:
-    // ============================================================
-    // 【待机时钟】三态：正常 → 空闲 kIdleToClockSec 秒进时钟 →
-    //                     时钟再显示 kClockToOffSec 秒关背光
-    // 任一交互（按键 / 唤醒词 / 闹钟 / 开始说话）都会立刻回到正常态。
-    // 待机只关背光，舵机保持上电，避免反复上电抖动。
-    // ============================================================
-    static constexpr int kIdleToClockSec = 30;   // 多久没操作进时钟
-    static constexpr int kClockToOffSec  = 60;   // 时钟显示多久后关背光
-    static constexpr int kClockTickSec   = 1;    // 刷新间隔（秒）
-
-    // 用 SNTP 校准的基准 + 单调计数器推算，不受调度延迟影响
-    time_t NowUtc() const {
-        if (!time_valid_) {
-            return 0;
-        }
-        int64_t elapsed = esp_timer_get_time() - time_base_us_;
-        return time_base_t_ + (time_t)(elapsed / 1000000LL);
-    }
-
-    void ClockCalibrate() {
-        timeval tv;
-        if (gettimeofday(&tv, nullptr) == 0 && tv.tv_sec > 1600000000L) {
-            time_base_us_ = esp_timer_get_time();
-            time_base_t_  = tv.tv_sec;
-            time_valid_   = true;
-        }
-    }
-
-    static const char* WeekName(struct tm* t) {
-        static const char* kWeek[] = {"周日","周一","周二","周三","周四","周五","周六"};
-        return kWeek[t->tm_wday % 7];
-    }
-
-    // 本地时间字符串 "2026-11-24 周二 20:30"
-    std::string ClockTimeStr() {
-        ClockCalibrate();
-        if (!time_valid_) {
-            return "等待网络对时...";
-        }
-        time_t utc = NowUtc() + TIME_ZONE_UTC_OFFSET * 3600;
-        struct tm t;
-        gmtime_r(&utc, &t);
-        char buf[40];
-        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %s %02d:%02d",
-                 t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                 WeekName(&t), t.tm_hour, t.tm_min);
-        return std::string(buf);
-    }
-
-    // 日期行 "2026年11月24日"，与秒数分开刷新，减少重绘
-    std::string ClockDateStr() {
-        if (!time_valid_) {
-            return "";
-        }
-        time_t utc = NowUtc() + TIME_ZONE_UTC_OFFSET * 3600;
-        struct tm t;
-        gmtime_r(&utc, &t);
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d年%d月%d日", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-        return std::string(buf);
-    }
-
-    void ClockShow() {
-        if (display_ == nullptr) {
-            return;
-        }
-        display_->SetEmotion("neutral");
-        display_->SetChatMessage("system", ClockTimeStr().c_str());
-    }
-
-    // 有交互：秒表清零，若原本在时钟/休眠态则恢复显示
-    // @param by_user  true=用户主动操作，立刻亮屏并退出时钟态
-    //                 false=系统事件（如说话），只退出不强制亮屏
-    bool ClockWake(bool by_user) {
-        idle_sec_ = 0;
-        bool was_clock = clock_on_ || clock_dim_;
-        if (was_clock) {
-            clock_on_  = false;
-            clock_dim_ = false;
-            if (by_user && GetBacklight() != nullptr) {
-                GetBacklight()->RestoreBrightness();
+    void BootAdvance() {
+        // 等首帧上屏（最多 3 秒兜底，防止网络异常时一直不出来）
+        while (boot_phase_ == kBootEarly && boot_wait_ms_ < 3000) {
+            DeviceState st = Application::GetInstance().GetDeviceState();
+            if (st == kDeviceStateListening || st == kDeviceStateSpeaking ||
+                st == kDeviceStateIdle || st == kDeviceStateActivating) {
+                break;
             }
-            if (display_ != nullptr && !screen_off_) {
-                display_->SetChatMessage("system", "");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            boot_wait_ms_ += 50;
+        }
+        boot_phase_ = kBootUiUp;
+
+        // 1. 音频：I2S 驱动安装 + DMA 分配，之前白屏的主因
+        InitializeAudioCodec();
+
+        // 2. 摄像头探测（I2C 探测 + 复位延时，几百毫秒级）
+        DetectCamera();
+        if (has_camera_) {
+            if (!InitializeCamera()) {
+                has_camera_ = false;
             }
         }
-        return was_clock;
-    }
 
-    static void ClockTimerCb(void* arg) {
-        static_cast<OttoRobot*>(arg)->ClockTick();
-    }
+        // 3. 舵机控制器 + MCP 工具
+        InitializeOttoController();
+        InitializeCustomMcpTools();
+        boot_phase_ = kBootSettled;
 
-    void ClockTick() {
-        // 软关机期间由唤醒流程接管，这里不插手
-        if (screen_off_ || alarm_active_) {
-            idle_sec_ = 0;
-            return;
-        }
-        // 正在对话/说话时不做待机
-        DeviceState st = Application::GetInstance().GetDeviceState();
-        if (st == kDeviceStateSpeaking || st == kDeviceStateListening) {
-            idle_sec_ = 0;
-            if (clock_on_ || clock_dim_) {
-                ClockWake(false);
-            }
-            return;
-        }
+        // 4. 画面稳了，最后才让舵机逐个归位
+        vTaskDelay(pdMS_TO_TICKS(500));
+        OttoController_BootHomeSequence();
+        ESP_LOGI(TAG, "开机舵机逐位归位完成");
 
-        idle_sec_++;
-
-        if (!clock_on_ && !clock_dim_) {
-            if (idle_sec_ >= kIdleToClockSec) {
-                clock_on_ = true;
-                ESP_LOGI(TAG, "进入待机时钟");
-                ClockShow();
-            }
-            return;
-        }
-
-        if (clock_dim_) {
-            // 休眠中：每 10 秒轻唤醒一次刷新时间（用户能看到时间在走）
-            if (idle_sec_ % 10 == 0 && GetBacklight() != nullptr) {
-                GetBacklight()->RestoreBrightness();
-                ClockShow();
-                clock_dim_ = false;
-                idle_sec_  = kIdleToClockSec;  // 继续计时，但保持时钟态
-            }
-            return;
-        }
-
-        // 时钟显示态：每秒刷新时间
-        ClockShow();
-
-        if (idle_sec_ >= kIdleToClockSec + kClockToOffSec) {
-            // 转休眠：只关背光，舵机不下电
-            if (GetBacklight() != nullptr) {
-                GetBacklight()->SetBrightness(0);
-            }
-            clock_dim_ = true;
-            ESP_LOGI(TAG, "待机时钟转背光休眠（舵机保持上电）");
-        }
-    }
-
-    void ClockInit() {
-        esp_timer_create_args_t args = {};
-        args.callback = &OttoRobot::ClockTimerCb;
-        args.arg      = this;
-        args.dispatch_method = ESP_TIMER_TASK;
-        args.name     = "otto_clock";
-        if (esp_timer_create(&args, &clock_timer_) == ESP_OK) {
-            esp_timer_start_periodic(clock_timer_, (uint64_t)kClockTickSec * 1000000ULL);
-            ESP_LOGI(TAG, "待机时钟已启动（%ds 后进时钟，%ds 后关背光）",
-                     kIdleToClockSec, kClockToOffSec);
-        } else {
-            ESP_LOGE(TAG, "待机时钟定时器创建失败");
+        if (display_ != nullptr && !screen_off_) {
+            display_->SetChatMessage("system", "你好，我准备好了");
         }
     }
 
     // ============================================================
-    // 【优化 2】闹钟：播报 3 次 + 温柔招手
-    // 用 tick 定时器驱动状态机，全程不阻塞任何任务，
-    // 所以播报期间语音唤醒、按按键、关机都照样能打断。
+    // 闹钟：播报 3 次「主人，时间到了」+ 温柔招手
+    // 用周期定时器驱动状态机，全程不阻塞任何任务
     // ============================================================
-    static void AlarmTickCallback(void* arg) {
-        auto* self = static_cast<OttoRobot*>(arg);
-        if (self != nullptr) {
-            self->AlarmTick();
-        }
-    }
-
-    void AlarmTick() {
-        if (!alarm_active_) {
-            return;
-        }
-
-        // 屏幕从黑屏态被闹钟叫亮（用户关机后设的闹钟也要能响）
-        if (screen_off_) {
-            TurnScreenOn();
-        }
-
-        alarm_round_++;
-        ESP_LOGI(TAG, "闹钟第 %d/%d 轮", alarm_round_, kAlarmMaxRounds);
-
-        if (alarm_round_ > kAlarmMaxRounds) {
-            StopAlarmSequence(true);
-            return;
-        }
-
-        if (display_ != nullptr) {
-            display_->SetEmotion("excited");
-            display_->SetChatMessage("system", alarm_name_.empty() ? "时间到了" : alarm_name_.c_str());
-        }
-
-        // ★ 闹钟播报入口 ★
-        // 当前用内置提示音 OGG_WELCOME 占位。要念出"主人，时间到了"，
-        // 把这行换成框架的 TTS 接口即可，例如：
-        //     Application::GetInstance().Speak("主人，时间到了");
-        // （框架头文件里 TTS 方法的真实名字，用这条命令查：
-        //   grep -n "Speak\|PlayTts\|Say(" application.h ）
-        // 注意：不要用 MCP 返回值让模型来说，模型会自行加"好的，我的朋友"之类的话。
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
-
-        // 先出声，间隔 700ms 再抬手，避免"声音和动作抢同一时刻"显得机械
-        vTaskDelay(pdMS_TO_TICKS(700));
-        OttoController_GentleWave();
-    }
-
-    // 停止播报。settle=true 表示收尾时让舵机安静归位
-    void StopAlarmSequence(bool settle) {
+    void AlarmStopTimers() {
         if (alarm_tick_timer_ != nullptr) {
             esp_timer_stop(alarm_tick_timer_);
             esp_timer_delete(alarm_tick_timer_);
@@ -706,82 +335,173 @@ private:
             esp_timer_delete(alarm_timer_);
             alarm_timer_ = nullptr;
         }
-        alarm_active_ = false;
-        alarm_round_ = 0;
-
-        if (settle && !screen_off_) {
-            OttoController_ClearQueue();      // 丢掉还没播完的招手，别攒着一股脑补
-            if (display_ != nullptr) {
-                display_->SetEmotion("neutral");
-                display_->SetChatMessage("system", "");
-            }
-        }
-        ESP_LOGI(TAG, "闹钟播报结束");
     }
 
-    static void AlarmStartCallback(void* arg) {
-        auto* self = static_cast<OttoRobot*>(arg);
-        if (self == nullptr) {
+    // 收尾：播够 3 次或被用户打断
+    void StopAlarmSequence(bool by_user) {
+        AlarmStopTimers();
+        bool was_active = alarm_active_;
+        alarm_active_ = false;
+        alarm_round_  = 0;
+
+        OttoController_ClearQueue();  // 丢掉没播完的招手
+        if (was_active && !by_user) {
+            OttoController_GentleWave();  // 最后一轮让身体回到舒展姿态
+        }
+        if (by_user) {
+            ESP_LOGI(TAG, "闹钟被打断");
+        } else {
+            ESP_LOGI(TAG, "闹钟播报结束");
+        }
+    }
+
+    static void AlarmTickCb(void* arg) {
+        static_cast<OttoRobot*>(arg)->AlarmTick();
+    }
+
+    void AlarmTick() {
+        if (!alarm_active_) {
             return;
         }
-        // 到点了：先清掉单次定时器句柄，再启动播报节拍
-        if (self->alarm_timer_ != nullptr) {
-            esp_timer_delete(self->alarm_timer_);
-            self->alarm_timer_ = nullptr;
-        }
-
-        self->alarm_active_ = true;
-        self->alarm_round_ = 0;
-
-        esp_timer_create_args_t tick_args = {};
-        tick_args.callback = &OttoRobot::AlarmTickCallback;
-        tick_args.arg = self;
-        tick_args.dispatch_method = ESP_TIMER_TASK;
-        tick_args.name = "otto_alarm_tick";
-
-        if (esp_timer_create(&tick_args, &self->alarm_tick_timer_) != ESP_OK) {
-            ESP_LOGE(TAG, "闹钟节拍创建失败");
-            self->alarm_active_ = false;
+        alarm_round_++;
+        if (alarm_round_ > 3) {
+            StopAlarmSequence(false);
             return;
         }
-        // 立刻先响第一轮，之后每 kAlarmIntervalMs 一轮
-        esp_timer_start_periodic(self->alarm_tick_timer_, (uint64_t)kAlarmIntervalMs * 1000ULL);
-        ESP_LOGI(TAG, "闹钟触发，开始 %d 轮播报", OttoRobot::kAlarmMaxRounds);
+
+        // 黑屏时先亮屏，不然用户看不见
+        if (screen_off_) {
+            TurnScreenOn();
+        }
+
+        auto& app = Application::GetInstance();
+        // ★ 闹钟播报入口 ★
+        // 屏幕弹「主人，时间到了」+ 表情，这是本地弹窗，不需要服务端 TTS
+        app.Alert("闹钟", alarm_name_.empty() ? "主人，时间到了" : alarm_name_.c_str(),
+                  "excited", "");
+        ESP_LOGI(TAG, "闹钟播报第 %d/3 次", alarm_round_);
+
+        // 700ms 后招手，让"提醒"和"动作"错开，观感更像互动
+        vTaskDelay(pdMS_TO_TICKS(700));
+        if (alarm_active_) {
+            OttoController_GentleWave();
+        }
+    }
+
+    static void AlarmStartCb(void* arg) {
+        static_cast<OttoRobot*>(arg)->AlarmStart();
+    }
+
+    void AlarmStart() {
+        ESP_LOGI(TAG, "闹钟到点，开始播报");
+        alarm_active_ = true;
+        alarm_round_  = 0;
+
+        esp_timer_create_args_t args = {};
+        args.callback = &OttoRobot::AlarmTickCb;
+        args.arg      = this;
+        args.dispatch_method = ESP_TIMER_TASK;
+        args.name     = "otto_alarm_tick";
+        if (esp_timer_create(&args, &alarm_tick_timer_) != ESP_OK) {
+            ESP_LOGE(TAG, "闹钟节拍定时器创建失败");
+            alarm_active_ = false;
+            return;
+        }
+        // 立刻先播一次，之后每 3.2 秒一轮
+        AlarmTick();
+        if (alarm_active_) {
+            esp_timer_start_periodic(alarm_tick_timer_, 3200000ULL);
+        }
     }
 
     // ============================================================
-    // MCP 工具注册
+    // 软关机 / 唤醒
+    // ============================================================
+    void EnterSoftShutdown() {
+        ESP_LOGI(TAG, "进入软关机序列");
+
+        // 1. 闹钟停掉（正在播报也一并收住）
+        StopAlarmSequence(false);
+
+        // 2. 屏幕先黑，给用户"已经关了"的即时反馈
+        TurnScreenOff();
+
+        // 3. 舵机归位 → 逐个下电。这一步在独立任务里做，
+        //    因为它要等约 2.5 秒，不能卡住 MCP 调用线程（否则语音回话都播不出来）
+        xTaskCreate([](void* arg) {
+            (void)arg;  // 下电走全局 C 接口，不需要 this
+            // 等语音回话的提示音播完，避免舵机电流噪声盖住声音
+            vTaskDelay(pdMS_TO_TICKS(600));
+            OttoController_Sleep();
+            ESP_LOGI(TAG, "软关机完成：舵机已下电、屏幕已关，等待语音唤醒");
+            vTaskDelete(NULL);
+        }, "otto_shutdown", 3072, nullptr, 3, nullptr);
+    }
+
+    // ============================================================
+    // 唤醒：舵机重新上电 + 自动亮屏
+    // 软关机期间 MCU 和麦克风一直在跑，唤醒词照样能触发；
+    // 语音链路本身由 Application 处理，这里只负责"把灯打开、把舵机叫醒"。
+    // ============================================================
+    void WakeUpFromSoftShutdown() {
+        if (!screen_off_) {
+            return;  // 本来就是醒的，别重复上电
+        }
+        ESP_LOGI(TAG, "从软关机唤醒");
+
+        // 1. 若闹钟正在播报，唤醒视为"知道了"，直接收尾
+        if (alarm_active_) {
+            StopAlarmSequence(true);
+        }
+
+        // 2. 屏幕先亮，让用户立刻看到反馈
+        TurnScreenOn();
+        if (display_ != nullptr) {
+            display_->SetEmotion("happy");
+        }
+
+        // 3. 舵机重新上电并慢速归位（独立任务，不阻塞按键回调）
+        xTaskCreate([](void* arg) {
+            (void)arg;
+            OttoController_Wakeup();
+            ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电");
+            vTaskDelete(NULL);
+        }, "otto_wakeup", 3072, nullptr, 3, nullptr);
+    }
+
+    // ============================================================
+    // MCP 工具：闹钟 / 关机
     // ============================================================
     void InitializeCustomMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
 
-        // 1. 闹钟：到点播报 3 次 + 温柔招手
+        // 1. 闹钟：到点后屏幕弹「主人，时间到了」+ 温柔招手，连播 3 次
         mcp_server.AddTool(
             "self.Alarm",
-            "设置一个闹钟。到点后会用语音连说三遍“主人，时间到了”，同时温柔地招手互动。"
-            "seconde_from_now: 多少秒后响铃；alarm_name: 闹钟的名称或提醒内容",
+            "设置一个闹钟。到点后屏幕会弹出提醒「主人，时间到了」并温柔招手互动，"
+            "连续提醒 3 次，期间说任何话或通过按键都会立刻停止。",
             PropertyList({
-                Property("seconde_from_now", kPropertyTypeInteger, 10, 0, 86400),
-                Property("alarm_name", kPropertyTypeString),
+                Property("seconds", kPropertyTypeInteger, 10, 1, 86400),
+                Property("name", kPropertyTypeString, "主人，时间到了"),
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                int seconds = properties["seconde_from_now"].value<int>();
-                std::string name = properties["alarm_name"].value<std::string>();
-
-                if (seconds <= 0) {
-                    return ReturnValue("闹钟时间必须大于 0 秒");
+                int seconds = properties["seconds"].value<int>();
+                if (properties.count("name") && !properties["name"].value<std::string>().empty()) {
+                    alarm_name_ = properties["name"].value<std::string>();
+                } else {
+                    alarm_name_ = "主人，时间到了";
                 }
-                alarm_name_ = name.empty() ? "时间到了" : name;
 
-                // 已有闹钟（含正在播报的）先整体清掉，再重设
-                StopAlarmSequence(false);
+                // 已有闹钟在跑就先撤掉
+                AlarmStopTimers();
+                alarm_active_ = false;
+                alarm_round_  = 0;
 
                 esp_timer_create_args_t args = {};
-                args.callback = &OttoRobot::AlarmStartCallback;
-                args.arg = this;
+                args.callback = &OttoRobot::AlarmStartCb;
+                args.arg      = this;
                 args.dispatch_method = ESP_TIMER_TASK;
-                args.name = "otto_alarm";
-
+                args.name     = "otto_alarm";
                 if (esp_timer_create(&args, &alarm_timer_) != ESP_OK) {
                     return ReturnValue("闹钟创建失败");
                 }
@@ -791,246 +511,95 @@ private:
                 return ReturnValue("");   // 空返回：不让模型复述，避免多出一句"好的，我的朋友"
             });
 
-        // 3. 待机时钟控制：让模型能主动开/关/读时间
-        mcp_server.AddTool(
-            "self.Clock",
-            "控制机器人的待机时钟屏幕。action 取值：show=立刻显示时间日期，hide=退出时钟回到正常表情，"
-            "now=返回当前时间（会把时间念出来）。",
-            PropertyList({
-                Property("action", kPropertyTypeString),
-            }),
-            [this](const PropertyList& properties) -> ReturnValue {
-                std::string act = properties["action"].value<std::string>();
-                if (act == "hide") {
-                    ClockWake(true);
-                    return ReturnValue("");
-                }
-                if (act == "now") {
-                    std::string t = ClockTimeStr();
-                    ESP_LOGI(TAG, "读时: %s", t.c_str());
-                    return ReturnValue(t);   // 字符串会交给模型念出来
-                }
-                // show：亮屏并立刻显示
-                if (screen_off_) {
-                    WakeUpFromSoftShutdown();
-                    return ReturnValue("");
-                }
-
-                if (GetBacklight() != nullptr) {
-                    GetBacklight()->RestoreBrightness();
-                }
-                clock_on_  = true;
-                clock_dim_ = false;
-                idle_sec_  = kIdleToClockSec;
-                ClockShow();
-                return ReturnValue("");
-            });
-
         // 2. 关机：语音回复后舵机归位下电、屏幕关闭，仅保留语音唤醒
         mcp_server.AddTool(
             "self.Shutdown",
-            "关闭机器人。会先用语音说“好的主人，我关机了”，然后舵机逐个归位并彻底断电省电，"
-            "屏幕关闭，只保留语音唤醒，叫一声“卡卡”就能重新开机亮屏。",
-            PropertyList(),
-            [this](const PropertyList& properties) -> ReturnValue {
-                // 先把回话播出去，再走关机序列（序列内部会等语音播完再断舵机电）
+            "让机器人进入省电休眠：舵机归位并彻底下电、屏幕关闭，但语音唤醒始终可用，"
+            "说唤醒词或按开机键即可立刻恢复。",
+            PropertyList({}),
+            [this](const PropertyList&) -> ReturnValue {
                 EnterSoftShutdown();
-                // 空返回：不回传任何文本给模型，否则模型会自行复述成
-                // "好的，我的朋友"这类多余的话。关机提示音由 EnterSoftShutdown 内部播放。
-                return ReturnValue("");
+                return ReturnValue("");   // 空返回：不让模型复述
             });
     }
 
-    // ============================================================
-    // 【优化 3】软关机：舵机归位 → 下电 → 关屏，只留语音唤醒
-    // MCU 与 I2S 麦克风全程不停，所以唤醒词随时可用；
-    // 真正省下来的是舵机保持电流（detach 后归零）和屏幕背光功耗。
-    // ============================================================
-    void EnterSoftShutdown() {
-        ESP_LOGI(TAG, "进入软关机序列");
-
-        // 1. 闹钟停掉（正在播报也一并收住）
-        StopAlarmSequence(false);
-        ClockWake(false);   // 待机时钟一并退出
-
-        // 2. 屏幕先黑，给用户"已经关了"的即时反馈
-        TurnScreenOff();
-
-        // 3. 舵机归位 → 逐个下电。这一步在独立任务里做，
-        //    因为它要等约 2.5 秒，不能卡住 MCP 调用线程（否则语音回话都播不出来）
-        xTaskCreate([](void* arg) {
-            (void)arg;  // 下电走全局 C 接口，不需要 this
-            // 等关机提示音播完再动舵机，声音不会被舵机电流噪声盖住
-            vTaskDelay(pdMS_TO_TICKS(600));
-            OttoController_Sleep();      // 内部：归位 → 逐个 detach → LEDC 保持电流归零
-            ESP_LOGI(TAG, "软关机完成：舵机已下电、屏幕已关，等待语音唤醒");
-            vTaskDelete(NULL);
-        }, "otto_shutdown", 3072, this, 3, nullptr);
-    }
-
-public:
-    const HardwareConfig& GetHardwareConfig() const { return hw_config_; }
-    OttoCameraType GetCameraType() const { return camera_type_; }
-
-private:
-    static constexpr int kAlarmMaxRounds = 3;      // 播报轮数
-    static constexpr int kAlarmIntervalMs = 3200;  // 每轮间隔：说话 + 招手约 2.5s，留余量
-
-    void InitializeWebSocketControlServer() {
-        ws_control_server_ = new WebSocketControlServer();
-        if (!ws_control_server_->Start(8080)) {
-            delete ws_control_server_;
-            ws_control_server_ = nullptr;
-            return;
-        }
-    }
-
-    void StartNetwork() override {
-        WifiBoard::StartNetwork();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        InitializeWebSocketControlServer();
-    }
-
-    bool InitializeCamera() {
-        if (!has_camera_ || i2c_bus_ == nullptr) {
-            return false;
-        }
-
-        // 释放检测阶段占用的 I2C 资源，避免与 esp_camera 初始化冲突。
-        i2c_del_master_bus(i2c_bus_);
-        i2c_bus_ = nullptr;
-        // 停止检测阶段输出的 XCLK，交由 esp_camera 自行接管。
-        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL, 0);
-
-        camera_config_t config = {};
-        config.ledc_channel = LEDC_CHANNEL_0;
-        config.ledc_timer = LEDC_TIMER_0;
-        config.pin_d0 = CAMERA_D0;
-        config.pin_d1 = CAMERA_D1;
-        config.pin_d2 = CAMERA_D2;
-        config.pin_d3 = CAMERA_D3;
-        config.pin_d4 = CAMERA_D4;
-        config.pin_d5 = CAMERA_D5;
-        config.pin_d6 = CAMERA_D6;
-        config.pin_d7 = CAMERA_D7;
-        config.pin_xclk = CAMERA_XCLK;
-        config.pin_pclk = CAMERA_PCLK;
-        config.pin_vsync = CAMERA_VSYNC;
-        config.pin_href = CAMERA_HSYNC;
-        config.pin_sccb_sda = CAMERA_VERSION_CONFIG.i2c_sda_pin;
-        config.pin_sccb_scl = CAMERA_VERSION_CONFIG.i2c_scl_pin;
-        config.sccb_i2c_port = 0;
-        config.pin_pwdn = CAMERA_PWDN;
-        config.pin_reset = CAMERA_RESET;
-        config.xclk_freq_hz = CAMERA_XCLK_FREQ;
-        config.pixel_format = PIXFORMAT_RGB565;
-        config.frame_size = FRAMESIZE_240X240;
-        config.jpeg_quality = 12;
-        config.fb_count = 1;
-        config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-
-        camera_ = new (std::nothrow) Esp32Camera(config);
-        if (camera_ != nullptr && camera_type_ == OTTO_CAMERA_GC2145) {
-            // The GC2145 module is mounted 180 degrees relative to the OV sensors.
-            camera_->SetHMirror(false);
-            camera_->SetVFlip(false);
-            ESP_LOGI(TAG, "GC2145 orientation corrected (hmirror=0, vflip=0)");
-        }
-        return camera_ != nullptr;
-    }
-
-public:
-    OttoRobot()
-        : boot_button_(BOOT_BUTTON_GPIO),
-          audio_codec_(nullptr),
-          i2c_bus_(nullptr),
-          camera_(nullptr),
-          is_camera_board_(false),
-          has_camera_(false),
-          camera_type_(OTTO_CAMERA_NONE),
-          alarm_timer_(nullptr),
-          alarm_tick_timer_(nullptr),
-          alarm_round_(0),
-          alarm_active_(false),
-          screen_off_(false) {
-#if OTTO_HARDWARE_VERSION == OTTO_VERSION_AUTO
-        // GPIO15/GPIO16 在摄像头版上有外部上拉；无摄像头版由内部弱下拉保持为低。
-        is_camera_board_ = DetectHardwareVersion();
-        ESP_LOGI(TAG, "自动检测硬件版本: %s", is_camera_board_ ? "摄像头版" : "无摄像头版");
-#elif OTTO_HARDWARE_VERSION == OTTO_VERSION_CAMERA
-        is_camera_board_ = true;
-        ESP_LOGI(TAG, "强制使用摄像头版本配置");
-#elif OTTO_HARDWARE_VERSION == OTTO_VERSION_NO_CAMERA
-        is_camera_board_ = false;
-        ESP_LOGI(TAG, "强制使用无摄像头版本配置");
-#else
-#error \
-    "OTTO_HARDWARE_VERSION 设置无效，请使用 OTTO_VERSION_AUTO, OTTO_VERSION_CAMERA 或 OTTO_VERSION_NO_CAMERA"
-#endif
-
-        if (is_camera_board_) {
-            hw_config_ = CAMERA_VERSION_CONFIG;
-        } else {
-            hw_config_ = NON_CAMERA_VERSION_CONFIG;
-        }
-
-        // ===== 屏幕优先：先让画面出来，再干别的 =====
-        // DetectCamera() 要逐个探 I2C 地址、还带 100ms 级复位延时，
-        // 是启动期最慢的一段。原先它排在屏幕点亮之前，所以白屏很久。
-        // 现在把它整体挪到背光亮起之后，屏幕能提前几百毫秒出图。
-        InitializeSpi();
-        InitializeLcdDisplay();
-        ws_control_server_ = nullptr;
-        GetBacklight()->RestoreBrightness();   // ← 背光在这里就亮，不等后面的慢活
-
-        // 【优化 1】舵机归位任务紧接着创建，等 200ms 就逐个动，
-        // 用户看到的是"开机 → 舵机归位"，而不是"白屏 → 舵机归位 → 出图"
-        xTaskCreate(BootHomeTask, "otto_boot", 3072, this, 3, nullptr);
-
-        InitializeButtons();
-        InitializePowerManager();
-        InitializeAudioCodec();
-
-        // ===== 慢活全部放到屏幕亮起之后 =====
-        if (is_camera_board_) {
-            has_camera_ = DetectCamera();
-            if (!has_camera_) {
-                ESP_LOGW(TAG, "摄像头版未检测到摄像头，将跳过摄像头初始化");
-            }
-        }
-        if (has_camera_) {
-            if (!InitializeCamera()) {
-                has_camera_ = false;
-            }
-        }
-
-        // 先建舵机控制器（注册动作类 MCP 工具），再注册闹钟/关机工具
-        InitializeOttoController();
-        InitializeCustomMcpTools();
-        ClockInit();   // 待机时钟：空闲 30s 显示时间，再 60s 关背光
-    }
-
+    // ------------------------------------------------------------
+    // 板级虚函数
+    // ------------------------------------------------------------
     virtual AudioCodec* GetAudioCodec() override { return audio_codec_; }
     virtual Display* GetDisplay() override { return display_; }
 
     virtual Backlight* GetBacklight() override {
         static PwmBacklight* backlight = nullptr;
         if (backlight == nullptr) {
-            backlight =
-                new PwmBacklight(hw_config_.display_backlight_pin, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
+            backlight = new PwmBacklight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
+            backlight->SetBrightness(80);
         }
         return backlight;
     }
 
-    bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        level = 100;
-        charging = false;
-        discharging = true;  // 保持放电状态即可，100% 不会触发低电量拦截
+    virtual Led* GetLed() override {
+        static SingleLed led(BUILTIN_LED_GPIO, BUILTIN_LED_ACTIVE_LEVEL);
+        return &led;
+    }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        charging    = false;
+        discharging = true;
+        level       = 100;   // 暂未接真实电量检测
         return true;
     }
 
-    virtual Camera* GetCamera() override { return has_camera_ ? camera_ : nullptr; }
+    virtual std::string GetBoardJson() override {
+        return "{\"board\":\"otto-robot\",\"camera\":" + std::string(has_camera_ ? "true" : "false") + "}";
+    }
+
+public:
+    OttoRobot() : boot_button_(BOOT_BUTTON_GPIO) {
+        // 1. 电源管理（必须最先，很多板级初始化依赖它）
+        InitializePowerManager();
+
+        // 2. SPI + LCD + 背光：这一小段是全部初始化里唯一必须阻塞的部分，
+        //    因为它决定了用户多久能看到画面
+        InitializeSpi();
+        InitializeLcdDisplay();
+        if (GetBacklight() != nullptr) {
+            GetBacklight()->RestoreBrightness();
+        }
+
+        // 3. 按钮
+        InitializeButtons();
+
+        // 4. 屏幕已经能显示了，剩下的慢活全部交给后台任务，
+        //    等 Application 首帧上屏之后再干，避免白屏干等
+        xTaskCreate(&OttoRobot::BootFinishTask, "otto_boot", 4096, this, 3, nullptr);
+    }
+
+    virtual ~OttoRobot() {
+        AlarmStopTimers();
+        if (camera_ != nullptr) {
+            delete camera_;
+            camera_ = nullptr;
+        }
+        if (i2c_bus_ != nullptr) {
+            i2c_del_master_bus(i2c_bus_);
+            i2c_bus_ = nullptr;
+        }
+    }
+
+    virtual void Initialize() override {
+        // 屏幕已经亮着，这里不再做阻塞初始化，直接交给基类走网络与协议
+        WifiBoard::Initialize();
+    }
+
+private:
+    void InitializePowerManager() {
+        power_manager_ = new PowerManager(
+            POWER_CHARGE_DETECT_PIN, POWER_CHARGE_DETECT_LEVEL,
+            POWER_BATTERY_LEVEL_PIN, POWER_BATTERY_LEVEL_CHANNEL,
+            POWER_BATTERY_LEVEL_ATTEN, POWER_BATTERY_FULL_VOLTAGE,
+            POWER_BATTERY_EMPTY_VOLTAGE);
+    }
 };
 
 DECLARE_BOARD(OttoRobot);
