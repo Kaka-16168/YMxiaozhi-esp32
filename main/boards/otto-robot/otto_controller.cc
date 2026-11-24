@@ -20,6 +20,28 @@
 
 #define TAG "OttoController"
 
+// ============================================================
+// 【温柔化参数】集中放这里，想更慢就调小数值
+// ============================================================
+// 舵机角速度上限（度/秒）。库默认 240，这里压到一半：
+// 任何动作的角度变化都被插值摊开，瞬时电流峰值随之下降，这是防卡死的根本手段。
+static const int kServoLimitDegPerSec = 120;
+
+// 开机归位：单只舵机走位时间（毫秒）。数值越大转得越慢、越轻。
+// 1200 → 2000，接近默认的一半速度。
+static const int kBootServoSpeedMs = 2000;
+// 开机归位：相邻两只舵机的时间间隔（毫秒）。拉大让电流峰值彻底错开。
+static const int kBootStaggerMs = 300;
+// 收尾整体验证归位同样放慢
+static const int kHomeSettleSpeedMs = 1800;
+
+// 步态温和化：把模型的原始参数夹到"慢 + 小幅"区间。
+// speed 语义是"毫秒/步"，越大越慢；amount 是抬腿/摆臂幅度，越小越稳。
+static const int kGaitSpeedMin = 1400;   // 行走/转身的最慢兜底（原默认 700）
+static const int kGaitSpeedMax = 3000;
+static const int kGaitAmountMax = 30;    // 幅度上限（原默认 50，越大越容易失稳）
+static const int kStepCountMax = 4;      // 单次最多走几步，走多了累积漂移容易摔倒
+
 class OttoController {
 private:
     Otto otto_;
@@ -69,9 +91,27 @@ private:
         ACTION_WHIRLWIND_LEG = 19    // 旋风腿
     };
 
-    // 开机逐舵机归位时，相邻两个舵机之间的间隔。
-    // 180ms 足够让单个舵机的启动电流峰值过去，6 个舵机总耗时约 1.1 秒。
-    static constexpr int kBootStaggerMs = 180;
+    // 开机逐舵机归位间隔 kBootStaggerMs、单只走位时间 kBootServoSpeedMs
+    // 统一取文件顶部的全局温柔化参数，避免两处定义不一致。
+
+    // ======== 【温柔化】步态参数钳制 ===========
+    // 不管模型传什么值，行走/转身一律被压进"慢速 + 小幅 + 少步"区间。
+    // 这是防卡死第二道闸：步子小、速度慢，单步落地的冲击电流和机身晃动都显著下降。
+    static int ClampGaitSpeed(int speed) {
+        if (speed < kGaitSpeedMin) return kGaitSpeedMin;
+        if (speed > kGaitSpeedMax) return kGaitSpeedMax;
+        return speed;
+    }
+    static int ClampGaitAmount(int amount) {
+        if (amount < 0) return 0;
+        if (amount > kGaitAmountMax) return kGaitAmountMax;
+        return amount;
+    }
+    static int ClampStepCount(int steps) {
+        if (steps < 1) return 1;
+        if (steps > kStepCountMax) return kStepCountMax;
+        return steps;
+    }
 
     static void ActionTask(void* arg) {
         OttoController* controller = static_cast<OttoController*>(arg);
@@ -305,12 +345,18 @@ private:
                     // 执行预定义动作
                     switch (params.action_type) {
                         case ACTION_WALK:
-                            controller->otto_.Walk(params.steps, params.speed, params.direction,
-                                                   params.amount);
+                            // 【温柔化】慢速 + 小幅 + 少步，落地冲击最小
+                            controller->otto_.Walk(ClampStepCount(params.steps),
+                                                   ClampGaitSpeed(params.speed),
+                                                   params.direction,
+                                                   ClampGaitAmount(params.amount));
                             break;
                         case ACTION_TURN:
-                            controller->otto_.Turn(params.steps, params.speed, params.direction,
-                                                   params.amount);
+                            // 【温柔化】转身比行走更容易失稳，幅度再压一档
+                            controller->otto_.Turn(ClampStepCount(params.steps),
+                                                   ClampGaitSpeed(params.speed),
+                                                   params.direction,
+                                                   ClampGaitAmount(params.amount) / 2);
                             break;
                         case ACTION_JUMP:
                             controller->otto_.Jump(params.steps, params.speed);
@@ -439,21 +485,21 @@ private:
 
         // 逐只上电：直接对单个舵机写中立角，不等 Home 一次性全动
         // 用 ServoMoveSingle（若 Otto 未暴露该接口，见文件末尾说明改用 MoveServos）
-        const int kBootDelayMs = 180;
+        const int kBootDelayMs = kBootStaggerMs;
         const int kNeutral = 90;
 
         // 腿脚先归位（支撑结构先稳住），手部最后
-        BootOneServo(LEFT_LEG,   kNeutral, 1200, kBootDelayMs);
-        BootOneServo(RIGHT_LEG,  kNeutral, 1200, kBootDelayMs);
-        BootOneServo(LEFT_FOOT,  kNeutral, 1200, kBootDelayMs);
-        BootOneServo(RIGHT_FOOT, kNeutral, 1200, kBootDelayMs);
+        BootOneServo(LEFT_LEG,   kNeutral, kBootServoSpeedMs, kBootDelayMs);
+        BootOneServo(RIGHT_LEG,  kNeutral, kBootServoSpeedMs, kBootDelayMs);
+        BootOneServo(LEFT_FOOT,  kNeutral, kBootServoSpeedMs, kBootDelayMs);
+        BootOneServo(RIGHT_FOOT, kNeutral, kBootServoSpeedMs, kBootDelayMs);
         if (has_hands_) {
-            BootOneServo(LEFT_HAND,  45, 1200, kBootDelayMs);   // 手部中立不是 90
-            BootOneServo(RIGHT_HAND, 180 - 45, 1200, kBootDelayMs);
+            BootOneServo(LEFT_HAND,  45, kBootServoSpeedMs, kBootDelayMs);   // 手部中立不是 90
+            BootOneServo(RIGHT_HAND, 180 - 45, kBootServoSpeedMs, kBootDelayMs);
         }
 
         // 全部上电完成后再发一次整体验证归位（带上微调值），确保姿态一致
-        QueueAction(ACTION_HOME, 1, 1200, 1, 0);
+        QueueAction(ACTION_HOME, 1, kHomeSettleSpeedMs, 1, 0);
         ESP_LOGI(TAG, "开机逐只舵机上电归位完成");
     }
 
@@ -555,6 +601,12 @@ public:
 
         has_hands_ = (hw_config.left_hand_pin != GPIO_NUM_NC && hw_config.right_hand_pin != GPIO_NUM_NC);
         ESP_LOGI(TAG, "Otto机器人初始化%s手部舵机", has_hands_ ? "带" : "不带");
+
+        // 【温柔化】开启舵机角速度限制：库内每次写角度都会按该速率插值推进，
+        // 等于给所有动作（归位/行走/转身/招手）套了一层全局减速带。
+        // 数值越小越慢；120 度/秒约等于原来 240 的一半，起步冲击直接减半。
+        otto_.EnableServoLimit(kServoLimitDegPerSec);
+        ESP_LOGI(TAG, "舵机限速已开启: %d 度/秒", kServoLimitDegPerSec);
         ESP_LOGI(TAG, "舵机引脚配置: LL=%d, RL=%d, LF=%d, RF=%d, LH=%d, RH=%d",
                  hw_config.left_leg_pin, hw_config.right_leg_pin,
                  hw_config.left_foot_pin, hw_config.right_foot_pin,
@@ -627,7 +679,7 @@ public:
         // 会先自己弹到当前 PWM 对应的角度，可能轻微一抖，属正常现象。
         otto_.AttachServos();
         StartActionTaskIfNeeded();                    // 幂等，任务还在时什么都不做
-        QueueAction(ACTION_HOME, 1, 1200, 1, 0);      // 上电慢速归位，避免猛地一抖
+        QueueAction(ACTION_HOME, 1, kHomeSettleSpeedMs, 1, 0);      // 上电慢速归位，避免猛地一抖
         ESP_LOGI(TAG, "舵机重新上电，已入队归位动作");
     }
 
