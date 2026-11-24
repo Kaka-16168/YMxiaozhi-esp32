@@ -42,14 +42,18 @@ struct HardwareConfig {
     int audio_output_sample_rate;
     bool audio_use_simplex;
 
+    // 通用/全双工 I2S 引脚（你使用的模块为独立引脚，此处保留但不使用）
     gpio_num_t audio_i2s_gpio_ws;
     gpio_num_t audio_i2s_gpio_bclk;
     gpio_num_t audio_i2s_gpio_din;
     gpio_num_t audio_i2s_gpio_dout;
 
+    // 独立麦克风引脚
     gpio_num_t audio_i2s_mic_gpio_ws;
     gpio_num_t audio_i2s_mic_gpio_sck;
     gpio_num_t audio_i2s_mic_gpio_din;
+    
+    // 独立功放引脚
     gpio_num_t audio_i2s_spk_gpio_dout;
     gpio_num_t audio_i2s_spk_gpio_bclk;
     gpio_num_t audio_i2s_spk_gpio_lrck;
@@ -106,43 +110,52 @@ constexpr HardwareConfig CAMERA_VERSION_CONFIG = {
 
 constexpr HardwareConfig NON_CAMERA_VERSION_CONFIG = {
     .power_charge_detect_pin = GPIO_NUM_NC,
-    .power_adc_unit = ADC_UNIT_2,
-    .power_adc_channel = ADC_CHANNEL_3,
+    // 修复：ADC2在Wi-Fi下不可用，必须改ADC1
+    .power_adc_unit = ADC_UNIT_1, 
+    .power_adc_channel = ADC_CHANNEL_1,
 
-    .right_leg_pin = GPIO_NUM_41,
-    .right_foot_pin = GPIO_NUM_42,
-    .left_leg_pin = GPIO_NUM_17,
-    .left_foot_pin = GPIO_NUM_18,
-    .left_hand_pin = GPIO_NUM_8,
-    .right_hand_pin = GPIO_NUM_12,
+    // 适配你的 6 路舵机
+    .right_leg_pin = GPIO_NUM_5,
+    .right_foot_pin = GPIO_NUM_8,
+    .left_leg_pin = GPIO_NUM_6,
+    .left_foot_pin = GPIO_NUM_4,
+    .left_hand_pin = GPIO_NUM_41,
+    .right_hand_pin = GPIO_NUM_42, 
 
     .audio_input_sample_rate = 16000,
     .audio_output_sample_rate = 24000,
-    .audio_use_simplex = true,
+    // 修复：引脚独立引出，使用单工模式
+    .audio_use_simplex = true, 
 
+    // 通用引脚设为 NC，交由下方的独立引脚接管
     .audio_i2s_gpio_ws = GPIO_NUM_NC,
     .audio_i2s_gpio_bclk = GPIO_NUM_NC,
     .audio_i2s_gpio_din = GPIO_NUM_NC,
     .audio_i2s_gpio_dout = GPIO_NUM_NC,
 
-    .audio_i2s_mic_gpio_ws = GPIO_NUM_4,
-    .audio_i2s_mic_gpio_sck = GPIO_NUM_5,
-    .audio_i2s_mic_gpio_din = GPIO_NUM_6,
-    .audio_i2s_spk_gpio_dout = GPIO_NUM_7,
-    .audio_i2s_spk_gpio_bclk = GPIO_NUM_15,
-    .audio_i2s_spk_gpio_lrck = GPIO_NUM_16,
+    // 修复：独立麦克风引脚 (SCK, WS, SD)
+    .audio_i2s_mic_gpio_ws = GPIO_NUM_21,      
+    .audio_i2s_mic_gpio_sck = GPIO_NUM_18,     
+    .audio_i2s_mic_gpio_din = GPIO_NUM_17,     
+    
+    // 修复：独立功放引脚 (DIN, BCLK, LRCLK)
+    .audio_i2s_spk_gpio_dout = GPIO_NUM_16,    
+    .audio_i2s_spk_gpio_bclk = GPIO_NUM_15,    
+    .audio_i2s_spk_gpio_lrck = GPIO_NUM_7,     
 
+    // 适配 1.54寸 ST7789 屏幕 (避开了危险引脚)
     .display_backlight_pin = GPIO_NUM_3,
     .display_mosi_pin = GPIO_NUM_10,
     .display_clk_pin = GPIO_NUM_9,
-    .display_dc_pin = GPIO_NUM_13,
+    .display_dc_pin = GPIO_NUM_13,             
     .display_rst_pin = GPIO_NUM_11,
-    .display_cs_pin = GPIO_NUM_14,
+    .display_cs_pin = GPIO_NUM_12,
 
     .i2c_sda_pin = GPIO_NUM_NC,
     .i2c_scl_pin = GPIO_NUM_NC,
 };
 
+// 摄像头部分引脚定义保持不变（仅供编译通过，你未使用该配置）
 #define CAMERA_XCLK (GPIO_NUM_3)
 #define CAMERA_PCLK (GPIO_NUM_10)
 #define CAMERA_VSYNC (GPIO_NUM_17)
