@@ -31,6 +31,16 @@
 
 #define TAG "OttoRobot"
 
+// ===== 板型识别引脚 =====
+// 官方 README：固件启动时把 GPIO15 / GPIO16 配成输入 + 弱下拉，连续采样稳定为高
+// 即判定为 CAM 板。这两个脚号若你的 config.h 里已有同名宏，以 config.h 为准。
+#ifndef OTTO_BOARD_DETECT_GPIO_1
+#define OTTO_BOARD_DETECT_GPIO_1  GPIO_NUM_15
+#endif
+#ifndef OTTO_BOARD_DETECT_GPIO_2
+#define OTTO_BOARD_DETECT_GPIO_2  GPIO_NUM_16
+#endif
+
 extern void InitializeOttoController(const HardwareConfig& hw_config);
 
 // ============================================================
@@ -97,13 +107,50 @@ private:
     // ------------------------------------------------------------
     // 硬件识别
     // ------------------------------------------------------------
-    // 【重要】不再用 GPIO15/GPIO16 电平探测板型：
-    // 这两个脚在无摄像头版里是音频脚（15=功放 BCLK、16=功放 LRCK），
-    // 在摄像头版里又接到摄像头数据总线，去 gpio_config 会与音频/摄像头
-    // 驱动抢引脚，是开机 ledc "GPIO is not usable" 报错的根源之一。
-    // 板型一律以 config.h 的 OTTO_HARDWARE_VERSION 编译期开关为准。
-    bool IsCameraBoard() const {
-        return (OTTO_HARDWARE_VERSION == OTTO_VERSION_CAMERA);
+    // ===== 官方「硬件版本自动识别」=====
+    // README 约定：启动时把 GPIO15 / GPIO16 配成输入 + 内部弱下拉，连续采样
+    // 若干次都稳定为高，判定为 CAM 板；否则按无摄像头板处理。
+    // CAM 板的识别不依赖摄像头模组是否真的插着——没插也会走 CAMERA_VERSION_CONFIG，
+    // 只是跳过摄像头初始化继续启动。这个区分是必需的：两套配置的舵机/音频/
+    // 摄像头脚位不同，套错配置就会撞引脚（表现为 ledc "GPIO is not usable"）。
+    // 探测完立刻把这两个脚还原成输入浮空，不占用驱动。
+    bool DetectHardwareVersion() {
+#if OTTO_HARDWARE_VERSION == OTTO_VERSION_CAMERA
+        return true;
+#elif OTTO_HARDWARE_VERSION == OTTO_VERSION_NO_CAMERA
+        return false;
+#else
+        const gpio_num_t pins[2] = {OTTO_BOARD_DETECT_GPIO_1, OTTO_BOARD_DETECT_GPIO_2};
+        gpio_config_t cfg = {};
+        cfg.pin_bit_mask = (1ULL << pins[0]) | (1ULL << pins[1]);
+        cfg.mode = GPIO_MODE_INPUT;
+        cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+        cfg.pull_down_en = GPIO_PULLDOWN_ENABLE;   // 弱下拉，靠外部上拉区分板型
+        cfg.intr_type = GPIO_INTR_DISABLE;
+        if (gpio_config(&cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "板型识别 GPIO 配置失败，按无摄像头版处理");
+            return false;
+        }
+        esp_rom_delay_us(5000);                     // 等下拉稳定
+        bool cam = true;
+        for (int i = 0; i < 8; ++i) {
+            if (gpio_get_level(pins[0]) == 0 || gpio_get_level(pins[1]) == 0) { cam = false; break; }
+            esp_rom_delay_us(1000);
+        }
+        // 探测结束，释放引脚（还原为输入、不上不下），交给后续驱动接管
+        gpio_config_t release = {};
+        release.pin_bit_mask = cfg.pin_bit_mask;
+        release.mode = GPIO_MODE_INPUT;
+        release.pull_up_en = GPIO_PULLUP_DISABLE;
+        release.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        release.intr_type = GPIO_INTR_DISABLE;
+        gpio_config(&release);
+        if (!cam) {
+            ESP_LOGI(TAG, "板型识别：GPIO%d/GPIO%d 未稳定为高 → 无摄像头版",
+                     (int)pins[0], (int)pins[1]);
+        }
+        return cam;
+#endif
     }
 
     bool DetectGc2145Camera(uint16_t& detected_pid) {
@@ -487,19 +534,14 @@ private:
             ESP_LOGI(TAG, "开机阶段：画面已稳，舵机开始逐个归位");
             OttoController_BootHomeSequence();
             ESP_LOGI(TAG, "开机舵机逐位归位完成");
-            BootShowReady();
+            // 【按需求】阶段3 只做归位，不再显示"你好，我准备好了"，也不动表情，
+            // 归位完成后不打扰已经上屏的画面。
             return true;
         }
         return true;
     }
 
-    // 归位完成后给一句明确的开场提示（此时画面和舵机都就绪了）
-    void BootShowReady() {
-        if (display_ != nullptr && !screen_off_) {
-            display_->SetEmotion("happy");
-            display_->SetChatMessage("system", "你好，我准备好了");
-        }
-    }
+    // BootShowReady() 已按需求移除：阶段3 归位后不再改画面。
 
     // ============================================================
     // 【优化 3】屏幕开关封装
@@ -529,10 +571,16 @@ private:
     // ============================================================
 public:
     void WakeUpFromSoftShutdown() {
-        if (!screen_off_) {
-            return;  // 本来就是醒的，别重复上电
+        // 【修复】这里原来有 `if (!screen_off_) return;` 早退。
+        // 语音唤醒路径下 screen_off_ 可能已被别处清掉，早退会让亮屏代码一行都不执行，
+        // 表现就是"喊了唤醒词、有回应但屏幕一直是黑的"。
+        // 现在改为无条件走完亮屏流程，用 force 区分是否已经处于关机态。
+        const bool was_off = screen_off_;
+        if (!was_off) {
+            ESP_LOGI(TAG, "唤醒：未处于软关机态，仍强制亮屏一次");
+        } else {
+            ESP_LOGI(TAG, "从软关机唤醒");
         }
-        ESP_LOGI(TAG, "从软关机唤醒");
         // 1. 若闹钟正在播报，唤醒视为"知道了"，直接收尾
         if (alarm_active_) {
             StopAlarmSequence(true);
@@ -729,6 +777,8 @@ private:
                 esp_timer_start_once(alarm_timer_, (uint64_t)seconds * 1000000ULL);
 
                 ESP_LOGI(TAG, "闹钟已设置: %d 秒后 -> %s", seconds, alarm_name_.c_str());
+                // 【修复】必须返回空串。返回任何文本都会被模型当成"要说的话"复述出来，
+                // 于是播完"主人，时间到了"之后又补一句"你好呀，我的朋友"。
                 return ReturnValue("");   // 空返回：不让模型复述，避免多出一句"好的，我的朋友"
             });
 
@@ -781,7 +831,10 @@ private:
             (void)arg;  // 下电走全局 C 接口，不需要 this
             // 等关机提示音播完再动舵机，声音不会被舵机电流噪声盖住
             vTaskDelay(pdMS_TO_TICKS(600));
-            OttoController_Sleep();      // 内部：归位 → 逐个 detach → LEDC 保持电流归零
+            // 【修复】下电前再兜一次闹钟：600ms 里可能正好轮到下一轮播报，
+            // 若不拦住，会出现"已关机但舵机又抬手招了一下"。
+            StopAlarmSequence(false);
+            OttoController_Sleep();      // 内部：清队列 → 逐个 detach → LEDC 保持电流归零
             ESP_LOGI(TAG, "软关机完成：舵机已下电、屏幕已关，等待语音唤醒");
             vTaskDelete(NULL);
         }, "otto_shutdown", 3072, this, 3, nullptr);
@@ -879,10 +932,10 @@ public:
           alarm_round_(0),
           alarm_active_(false),
           screen_off_(false) {
-        // 板型一律由 config.h 的 OTTO_HARDWARE_VERSION 决定，不再探测 GPIO 电平
-        // （GPIO15/16 是舵机/音频脚，探测会抢引脚，导致 ledc 报错、舵机失灵）
-        is_camera_board_ = IsCameraBoard();
-        ESP_LOGI(TAG, "硬件版本: %s（由 OTTO_HARDWARE_VERSION=%d 指定）",
+        // 显式指定 CAMERA / NO_CAMERA 时编译期直接定死（不产生任何 GPIO 操作）；
+        // AUTO 时按官方办法探测 GPIO15/16 电平。
+        is_camera_board_ = DetectHardwareVersion();
+        ESP_LOGI(TAG, "硬件版本: %s（OTTO_HARDWARE_VERSION=%d）",
                  is_camera_board_ ? "摄像头版" : "无摄像头版",
                  (int)OTTO_HARDWARE_VERSION);
 #if OTTO_HARDWARE_VERSION != OTTO_VERSION_CAMERA && \
@@ -891,10 +944,11 @@ public:
 #error \
     "OTTO_HARDWARE_VERSION 设置无效，请使用 OTTO_VERSION_AUTO, OTTO_VERSION_CAMERA 或 OTTO_VERSION_NO_CAMERA"
 #endif
-        if (OTTO_HARDWARE_VERSION == OTTO_VERSION_AUTO) {
-            ESP_LOGW(TAG, "OTTO_HARDWARE_VERSION=AUTO 已按无摄像头版处理；"
-                          "若要接摄像头，请显式改为 OTTO_VERSION_CAMERA");
-        }
+#if OTTO_HARDWARE_VERSION == OTTO_VERSION_AUTO
+        ESP_LOGI(TAG, "AUTO 模式：板型由探测结果决定，%s",
+                 is_camera_board_ ? "已选中 CAMERA_VERSION_CONFIG"
+                                  : "已选中 NON_CAMERA_VERSION_CONFIG");
+#endif
 
         if (is_camera_board_) {
             hw_config_ = CAMERA_VERSION_CONFIG;
