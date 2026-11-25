@@ -204,7 +204,7 @@ private:
         ret = i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_);
         if (ret != ESP_OK) {
             // 只停自己那条通道，再复位定时器 1，绝不触碰定时器 0（舵机）
-            ledc_stop(LEDC_LOW_SPEED_MODE, kCameraLedcChannel);
+            ledc_stop(LEDC_LOW_SPEED_MODE, kCameraLedcChannel, 0 /*idle_level*/);
             ledc_timer_rst(LEDC_LOW_SPEED_MODE, kCameraLedcTimer);
             return false;
         }
@@ -292,7 +292,7 @@ private:
             i2c_del_master_bus(i2c_bus_);
             i2c_bus_ = nullptr;
             // 只停自己那条通道，再复位定时器 1，绝不触碰定时器 0（舵机）
-            ledc_stop(LEDC_LOW_SPEED_MODE, kCameraLedcChannel);
+            ledc_stop(LEDC_LOW_SPEED_MODE, kCameraLedcChannel, 0 /*idle_level*/);
             ledc_timer_rst(LEDC_LOW_SPEED_MODE, kCameraLedcTimer);
             camera_type_ = OTTO_CAMERA_NONE;
         } else {
@@ -568,7 +568,20 @@ private:
         }
     }
 
+    // 挂下一轮播报。delay_ms=0 表示立刻执行第一轮
+    void AlarmScheduleNextTick(uint64_t delay_ms) {
+        if (!alarm_active_ || alarm_tick_timer_ == nullptr) {
+            return;
+        }
+        esp_timer_stop(alarm_tick_timer_);
+        esp_timer_start_once(alarm_tick_timer_, delay_ms * 1000ULL);
+    }
+
     void AlarmTick() {
+        // 【关键】进回调第一件事就是确认自己还该不该播。
+        // 关机 / 唤醒 / 重设闹钟都会把 alarm_active_ 置 false 并删掉定时器，
+        // 但已派发到 esp_timer 任务的这次回调仍会执行到这里，
+        // 若不拦住，就会出现"关机了闹钟还在响"。
         if (!alarm_active_) {
             return;
         }
@@ -602,11 +615,24 @@ private:
 
         // 先出声，间隔 700ms 再抬手，避免"声音和动作抢同一时刻"显得机械
         vTaskDelay(pdMS_TO_TICKS(700));
+        // 关机可能在延时期间发生，再确认一次，别在关机后还抬手
+        if (!alarm_active_) {
+            return;
+        }
         OttoController_GentleWave();
+
+        // 本轮收尾，隔 kAlarmIntervalMs 再播下一轮（播满 3 轮由 StopAlarmSequence 收）
+        AlarmScheduleNextTick(kAlarmIntervalMs);
     }
 
     // 停止播报。settle=true 表示收尾时让舵机安静归位
     void StopAlarmSequence(bool settle) {
+        // 先置标志：这样已经排进 esp_timer 任务的回调会自行 return，
+        // 不会再触发新一轮播报（这是"闹钟关不掉"的根因）
+        const bool was_active = alarm_active_;
+        alarm_active_ = false;
+        alarm_round_  = 0;
+
         if (alarm_tick_timer_ != nullptr) {
             esp_timer_stop(alarm_tick_timer_);
             esp_timer_delete(alarm_tick_timer_);
@@ -627,7 +653,9 @@ private:
                 display_->SetChatMessage("system", "");
             }
         }
-        ESP_LOGI(TAG, "闹钟播报结束");
+        if (was_active) {
+            ESP_LOGI(TAG, "闹钟播报结束");
+        }
     }
 
     static void AlarmStartCallback(void* arg) {
@@ -655,8 +683,10 @@ private:
             self->alarm_active_ = false;
             return;
         }
-        // 立刻先响第一轮，之后每 kAlarmIntervalMs 一轮
-        esp_timer_start_periodic(self->alarm_tick_timer_, (uint64_t)kAlarmIntervalMs * 1000ULL);
+        // 用 oneshot 而不是 periodic：AlarmTick 内部有 vTaskDelay(700ms)，
+        // 若用周期定时器，回调会在 esp_timer 任务里堆积，第 2 轮还没跑完第 3 轮又进来，
+        // 表现为"只响一声 / 播报错乱 / 收不了尾"。改成每轮自己重新挂下一次。
+        self->AlarmScheduleNextTick(0);
         ESP_LOGI(TAG, "闹钟触发，开始 %d 轮播报", OttoRobot::kAlarmMaxRounds);
     }
 
@@ -725,11 +755,25 @@ private:
     void EnterSoftShutdown() {
         ESP_LOGI(TAG, "进入软关机序列");
 
-        // 1. 闹钟停掉（正在播报也一并收住）
+        // 1. 闹钟停掉（正在播报也一并收住）。
+        //    必须在起下电任务【之前】同步完成：StopAlarmSequence 会先置
+        //    alarm_active_=false 再删定时器，之后任何残留回调都会自行退出，
+        //    不会出现"关机后闹钟又把它叫醒"。
         StopAlarmSequence(false);
 
-        // 2. 屏幕先黑，给用户"已经关了"的即时反馈
-        TurnScreenOff();
+        // 2. 立刻清掉动作队列并标记屏幕已关。
+        //    原来只靠后台任务里的 OttoController_Sleep() 去清，中间有 600ms 空窗，
+        //    这期间模型若又下动作指令就会插进来，看起来像"关机没生效"。
+        OttoController_ClearQueue();
+        screen_off_ = true;                 // 先挡住重复进入与按键穿透
+        if (GetBacklight() != nullptr) {
+            GetBacklight()->SetBrightness(0);
+        }
+        if (display_ != nullptr) {
+            display_->SetChatMessage("system", "");
+            display_->SetEmotion("neutral");
+        }
+        ESP_LOGI(TAG, "关机已即时生效：闹钟已停、动作队列已清、屏幕已黑");
 
         // 3. 舵机归位 → 逐个下电。这一步在独立任务里做，
         //    因为它要等约 2.5 秒，不能卡住 MCP 调用线程（否则语音回话都播不出来）
@@ -777,7 +821,7 @@ private:
         // 停止【探测阶段】的 XCLK（定时器 1 的通道），交由 esp_camera 接管。
         // 【严禁】在这里 ledc_stop 定时器 0 —— 那是舵机的 PWM 定时器，
         // 停掉它 6 个舵机引脚会全部变成 "not usable"，动作就没输出了。
-        ledc_stop(LEDC_LOW_SPEED_MODE, kCameraLedcChannel);
+        ledc_stop(LEDC_LOW_SPEED_MODE, kCameraLedcChannel, 0 /*idle_level*/);
         ledc_timer_rst(LEDC_LOW_SPEED_MODE, kCameraLedcTimer);
 
         camera_config_t config = {};
