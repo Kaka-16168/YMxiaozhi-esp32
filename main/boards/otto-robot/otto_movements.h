@@ -92,9 +92,14 @@ public:
     void MagicCircle();  // 爱的魔力转圈圈
     void Showcase();  // 展示动作（串联多个动作）
 
-    // -- Servo limiter
+    // -- 舵机限速（度/秒）。传 0 关闭限速
     void EnableServoLimit(int speed_limit_degree_per_sec = SERVO_LIMIT_DEFAULT);
     void DisableServoLimit();
+
+    // -- 【本次新增】查询舵机通道是否已 attach（引脚已配置并输出中）
+    //    仅供上层诊断"动作没动"用：Init() 与 AttachServos() 都会置位，
+    //    DetachServos() 清零。不影响任何动作逻辑。
+    bool IsAttached() const { return servos_attached_; }
 
 private:
     Oscillator servo_[SERVO_COUNT];
@@ -108,10 +113,10 @@ private:
 
     bool is_otto_resting_;
     bool has_hands_;  // 是否有手部舵机
+    bool servos_attached_ = false;  // 【本次新增】attach 状态标记
 
     void Execute(int amplitude[SERVO_COUNT], int offset[SERVO_COUNT], int period,
                  double phase_diff[SERVO_COUNT], float steps);
-
 };
 
 #endif  // __OTTO_MOVEMENTS_H__
