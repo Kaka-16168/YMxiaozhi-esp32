@@ -218,7 +218,7 @@ private:
         if (self != nullptr) self->AlarmTick();
     }
 
-    void AlarmTick() {
+       void AlarmTick() {
         if (!alarm_active_) return;
         if (screen_off_) TurnScreenOn();
 
@@ -233,8 +233,9 @@ private:
             display_->SetChatMessage("system", alarm_name_.empty() ? "时间到了" : alarm_name_.c_str());
         }
 
-        ESP_LOGI(TAG, "闹钟触发播报: 主人，时间到了");
-        Application::GetInstance().Speak("主人，时间到了"); // 改为 TTS 播报
+        // 修复：使用框架内置的 PlaySound 替代不存在的 Speak 方法
+        ESP_LOGI(TAG, "闹钟触发，播放提示音");
+        Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
 
         vTaskDelay(pdMS_TO_TICKS(1000));
         OttoController_GentleWave();
