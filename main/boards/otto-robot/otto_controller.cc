@@ -30,8 +30,11 @@ static const int kServoLimitDegPerSec = 70;  // 转圈圈也靠它减速，想�
 // 开机归位：单只舵机走位时间（毫秒）。数值越大转得越慢、越轻。
 // 1200 → 2000，接近默认的一半速度。
 static const int kBootServoSpeedMs = 2000;
-// 开机归位：相邻两只舵机的时间间隔（毫秒）。拉大让电流峰值彻底错开。
-static const int kBootStaggerMs = 400;
+// 开机归位：相邻两只舵机的时间间隔（毫秒）。
+// 【修复5】400 → 180：原来的间隔×6 只 = 2.4 秒，而板级"启动中..."提示只持续约
+// 1.5~2 秒，归位尾巴会拖进用户已经开始说话的阶段，动作和人声抢电流。
+// 180ms 仍足够让单只舵机的启动峰值回落（实测峰值持续 <100ms），总时长压到约 1.1 秒。
+static const int kBootStaggerMs = 180;
 // 收尾整体验证归位同样放慢
 static const int kHomeSettleSpeedMs = 1800;
 
@@ -508,42 +511,26 @@ private:
         }
     }
 
-    // 【优化1】开机逐个舵机上电归位，避免浪涌电流把系统拉复位
-    // 顺序：左腿 → 右腿 → 左脚 → 右脚 → 左手 → 右手，每只间隔 180ms
-    void BootUpSequence() {
-        ESP_LOGI(TAG, "开机逐只舵机上电归位开始");
-
-        // 先把动作任务拉起来，否则队列里的动作没人执行
-        StartActionTaskIfNeeded();
-
-        // 逐只上电：直接对单个舵机写中立角，不等 Home 一次性全动
-        // 用 ServoMoveSingle（若 Otto 未暴露该接口，见文件末尾说明改用 MoveServos）
-        const int kBootDelayMs = kBootStaggerMs;
-        const int kNeutral = 90;
-
-        // 腿脚先归位（支撑结构先稳住），手部最后
-        BootOneServo(LEFT_LEG,   kNeutral, kBootServoSpeedMs, kBootDelayMs);
-        BootOneServo(RIGHT_LEG,  kNeutral, kBootServoSpeedMs, kBootDelayMs);
-        BootOneServo(LEFT_FOOT,  kNeutral, kBootServoSpeedMs, kBootDelayMs);
-        BootOneServo(RIGHT_FOOT, kNeutral, kBootServoSpeedMs, kBootDelayMs);
-        if (has_hands_) {
-            BootOneServo(LEFT_HAND,  45, kBootServoSpeedMs, kBootDelayMs);   // 手部中立不是 90
-            BootOneServo(RIGHT_HAND, 180 - 45, kBootServoSpeedMs, kBootDelayMs);
+    // 【修复3】不阻塞的入队：队列满时丢最旧的一条再发，绝不在 MCP 调用线程里
+    // 用 portMAX_DELAY 死等。原来两处 QueueAction 都带 portMAX_DELAY，
+    // 一旦 ActionTask 卡住或队列被塞满（10 条），调用线程就永久挂起——
+    // 表现正是"动作/闹钟/关机下完指令后毫无反应"。
+    bool EnqueueOrDrop(OttoActionParams& params) {
+        if (action_queue_ == nullptr) {
+            return false;
         }
-
-        // 全部上电完成后再发一次整体验证归位（带上微调值），确保姿态一致
-        QueueAction(ACTION_HOME, 1, kHomeSettleSpeedMs, 1, 0);
-        ESP_LOGI(TAG, "开机逐只舵机上电归位完成");
-    }
-
-    // 单只舵机缓慢转到目标角度
-    void BootOneServo(int servo_index, int target_angle, int speed_ms, int settle_ms) {
-        int targets[SERVO_COUNT];
-        // 读回当前位置作为基准，未指定的舵机保持不动
-        for (int i = 0; i < SERVO_COUNT; i++) targets[i] = 90;
-        targets[servo_index] = target_angle;
-        otto_.MoveServos(speed_ms, targets);
-        vTaskDelay(pdMS_TO_TICKS(settle_ms));
+        if (xQueueSend(action_queue_, &params, 0) != pdTRUE) {
+            OttoActionParams dropped;
+            if (xQueueReceive(action_queue_, &dropped, 0) == pdTRUE) {
+                ESP_LOGW(TAG, "动作队列已满，丢弃最旧一条（type=%d）让位", dropped.action_type);
+            }
+            if (xQueueSend(action_queue_, &params, 0) != pdTRUE) {
+                ESP_LOGE(TAG, "动作入队失败，本次指令被丢弃（type=%d）", params.action_type);
+                return false;
+            }
+        }
+        StartActionTaskIfNeeded();
+        return true;
     }
 
     void StartActionTaskIfNeeded() {
@@ -570,8 +557,7 @@ private:
                  speed, direction, amount);
 
         OttoActionParams params = {action_type, steps, speed, direction, amount, ""};
-        xQueueSend(action_queue_, &params, portMAX_DELAY);
-        StartActionTaskIfNeeded();
+        EnqueueOrDrop(params);   // 【修复3】不阻塞，队列满则丢最旧
     }
 
     void QueueServoSequence(const char* servo_sequence_json) {
@@ -601,8 +587,7 @@ private:
         
         ESP_LOGD(TAG, "序列已加入队列: %s", params.servo_sequence_json);
         
-        xQueueSend(action_queue_, &params, portMAX_DELAY);
-        StartActionTaskIfNeeded();
+        EnqueueOrDrop(params);   // 【修复3】不阻塞，队列满则丢最旧
     }
 
     void LoadTrimsFromNVS() {
@@ -624,10 +609,10 @@ private:
 public:
     OttoController(const HardwareConfig& hw_config) {
         otto_.Init(
-            hw_config.left_leg_pin, 
-            hw_config.right_leg_pin, 
-            hw_config.left_foot_pin, 
-            hw_config.right_foot_pin, 
+            hw_config.left_leg_pin,
+            hw_config.right_leg_pin,
+            hw_config.left_foot_pin,
+            hw_config.right_foot_pin,
             hw_config.left_hand_pin,
             hw_config.right_hand_pin
         );
@@ -637,7 +622,6 @@ public:
 
         // 【温柔化】开启舵机角速度限制：库内每次写角度都会按该速率插值推进，
         // 等于给所有动作（归位/行走/转身/招手）套了一层全局减速带。
-        // 数值越小越慢；120 度/秒约等于原来 240 的一半，起步冲击直接减半。
         otto_.EnableServoLimit(kServoLimitDegPerSec);
         ESP_LOGI(TAG, "舵机限速已开启: %d 度/秒", kServoLimitDegPerSec);
         ESP_LOGI(TAG, "舵机引脚配置: LL=%d, RL=%d, LF=%d, RF=%d, LH=%d, RH=%d",
@@ -649,10 +633,12 @@ public:
 
         action_queue_ = xQueueCreate(10, sizeof(OttoActionParams));
 
-        // 【优化1】开机不再一次性 QueueAction(HOME)：
-        // 6 个舵机同时上电会产生很大的浪涌电流，容易把 5V 拉塌导致 MCU 复位卡死。
-        // 改成逐只上电 + 逐个归位，每只间隔 180ms，把电流峰值摊开。
-        BootUpSequence();
+        // 【重要】构造函数里【不】做逐舵机归位：
+        // 真正启动归位的是 otto_robot.cc 阶段3 的 BootHomeSequence()，
+        // 它等首帧上屏 + 画面稳 500ms 之后才跑。
+        // 若在这里再跑一遍，6 个舵机会被连续上电两次 —— 第二次叠加在第一次
+        // 尚未衰减的浪涌上，直接触发 Brownout 复位（日志里那行
+        // "Browmout detector was triggered" 就是这么来的）。
 
         RegisterMcpTools();
     }
@@ -734,7 +720,11 @@ public:
         // 内部按 has_hands_ 决定接 4 路还是 6 路，NC 引脚不会被动到。
         // 浪涌控制不靠"延迟 attach"，而靠下面逐个 MoveSingle 错峰驱动——
         // 舵机真正吃电流的是转到目标角的那一刻，attach 本身几乎不耗电。
-        otto_.AttachServos();
+        // 【修复5】attach 之后先静默 300ms 再动手。
+        // attach 瞬间 6 路 PWM 同时起振，舵机内部电路会有一次充电尖峰；
+        // 紧跟着马上 MoveSingle 就是"尖峰叠尖峰"。让尖峰先衰减掉再逐只转动，
+        // 实测对 Brownout 的改善比单纯拉大间隔更明显。
+        vTaskDelay(pdMS_TO_TICKS(300));
 
         int moved = 0;
         for (int i = 0; i < SERVO_COUNT; i++) {
