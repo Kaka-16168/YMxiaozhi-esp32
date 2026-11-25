@@ -81,6 +81,14 @@ private:
     BootPhase boot_phase_ = kBootEarly;
     int boot_wait_ms_ = 0;
 
+    // ======== 启动闸门 ========
+    // 按钮回调注册的瞬间就可能被 GPIO 中断或 LVGL 输入事件派发，
+    // 而此时构造函数还没跑完（power_manager_ / audio_codec_ 尚为 nullptr，
+    // alarm_* 定时器句柄也未初始化）。回调一旦走进 WakeUpFromSoftShutdown()
+    // 就会解引用半成品对象 → Core panic (LoadProhibited)。
+    // 所以回调第一件事就是查这个闸门，构造函数全部做完才置 true。
+    bool boot_ready_ = false;
+
     // OV2640 有两个可能的 PID，抽成小函数避免长条件写错
     static bool pid_is_ov2640(uint16_t pid) {
         return pid == OTTO_OV2640_PID_1 || pid == OTTO_OV2640_PID_2;
@@ -323,6 +331,15 @@ private:
     // 基础外设初始化
     // ------------------------------------------------------------
     void InitializePowerManager() {
+        // 两套 HardwareConfig 的 power_charge_detect_pin 都是 GPIO_NUM_NC，
+        // 电量 ADC 也没接。此时仍去 new PowerManager 只会让它在
+        // adc_continuous_start 上报 258、并刷一串 "not supported" 警告。
+        // 这里直接判掉，GetBatteryLevel() 走硬编码 100% 的兜底路径。
+        if (hw_config_.power_charge_detect_pin == GPIO_NUM_NC) {
+            power_manager_ = nullptr;
+            ESP_LOGI(TAG, "电源管理引脚未配置（GPIO_NUM_NC），跳过 PowerManager 创建");
+            return;
+        }
         power_manager_ = new PowerManager(hw_config_.power_charge_detect_pin,
                                           hw_config_.power_adc_unit, hw_config_.power_adc_channel);
     }
@@ -371,6 +388,13 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            // ★ 闸门：构造函数未跑完，任何按键一律丢弃 ★
+            // 这是 Core panic (LoadProhibited) 的根因防线——回调可能在
+            // this 还没构造完成时就被派发，此时碰任何成员都是野指针。
+            if (!boot_ready_) {
+                ESP_LOGW(TAG, "按键事件在启动完成前到达，已丢弃");
+                return;
+            }
             // 软关机黑屏时，按一下开机键等于唤醒
             if (screen_off_) {
                 WakeUpFromSoftShutdown();
@@ -449,10 +473,8 @@ private:
             boot_phase_ = kBootUiUp;
             ESP_LOGI(TAG, "开机阶段：首帧已上屏，补初始化慢外设");
 
-            const int64_t t = esp_timer_get_time();
-            InitializeAudioCodec();
-            ESP_LOGI(TAG, "AudioCodec 初始化耗时 %lld ms", (esp_timer_get_time() - t) / 1000);
-
+            // AudioCodec 已在构造函数里建完（框架构造函数返回后就要用它装
+            // 音频流水线），这里绝不能重复 new，否则 I2S 驱动二次安装会失败。
             if (is_camera_board_) {
                 has_camera_ = DetectCamera();
                 if (!has_camera_) {
@@ -843,17 +865,31 @@ public:
         }
 
         // ===== 构造函数只做「不阻塞的事」，做完立刻返回 =====
-        // 顺序：SPI → LCD → 按钮 → 电源 → 背光亮 → 起开机尾巴任务。
-        // 音频编解码器、摄像头探测、舵机控制器全部挪到 BootFinishTask，
-        // 等 LVGL 首帧真正刷出来之后再补，这样开机就是「画面先出、舵机后动」。
+        // 【顺序是有讲究的，别随手调换】
+        //   1) SPI → LCD：先把显示链路立起来
+        //   2) PowerManager：必须在按钮之前，唤醒路径要用它
+        //   3) AudioCodec：必须在本函数内建完，框架在构造函数返回后就会
+        //      调 GetAudioCodec() 去装音频流水线，晚建等于没声音
+        //   4) 背光亮：画面开始出
+        //   5) ★ 按钮最后注册 ★，且 boot_ready_ 在它之后立刻置 true
+        // 摄像头探测、舵机控制器、MCP 工具仍留在 BootFinishTask 里等首帧。
         InitializeSpi();
         InitializeLcdDisplay();
-        InitializeButtons();
         InitializePowerManager();
+        InitializeAudioCodec();
         ws_control_server_ = nullptr;
-        GetBacklight()->RestoreBrightness();   // ← 背光立刻亮，画面随后就出来
 
-        // 开机尾巴任务：等首帧上屏 → 补慢外设 → 画面稳了才让舵机归位
+        if (display_ != nullptr) {
+            display_->SetChatMessage("system", "启动中...");
+            display_->SetEmotion("neutral");
+        }
+        GetBacklight()->RestoreBrightness();   // ← 背光亮，用户立刻看到画面
+
+        // 到这里所有成员都已构造完毕，才允许按钮回调生效
+        boot_ready_ = true;
+        InitializeButtons();
+
+        // 开机尾巴任务：等首帧上屏 → 补摄像头/舵机控制器 → 画面稳了才让舵机归位
         xTaskCreate(BootFinishTask, "otto_boot", 4096, this, 3, nullptr);
     }
 
