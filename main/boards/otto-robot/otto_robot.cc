@@ -989,8 +989,6 @@ public:
           has_camera_(false),
           camera_type_(OTTO_CAMERA_NONE),
           alarm_timer_(nullptr),
-          alarm_tick_task_(nullptr),   // 【修复7】补初始化，否则启动期误进 Stop 会删野句柄
-          alarm_tick_timer_(nullptr),
           alarm_round_(0),
           alarm_active_(false),
           screen_off_(false) {
