@@ -35,12 +35,18 @@ static const int kBootStaggerMs = 400;
 // 收尾整体验证归位同样放慢
 static const int kHomeSettleSpeedMs = 1800;
 
-// 步态温和化：把模型的原始参数夹到"慢 + 小幅"区间。
-// speed 语义是"毫秒/步"，越大越慢；amount 是抬腿/摆臂幅度，越小越稳。
-static const int kGaitSpeedMin = 1500;   // 行走/转身的最慢兜底（原默认 700，越大越慢）
+// 步态参数：与官方文档默认值对齐（speed 默认 700 / amount 默认 30 / steps 1~100）。
+// 【重要】这里只做合法性兜底，不再把动作强行压慢——
+// 真正防死机的是上面的 kServoLimitDegPerSec 角速度限制器：它管住每个舵机的
+// degrees/sec，对 magic_circle / showcase 这类不走 speed 参数的固定动作同样生效。
+// 此前把 speed 下限抬到 1500、amount 压到 25、steps 封到 3，副作用是官方示例里的
+// speed=500~800、amount=80、steps=10 全被改写成另一个动作，表演幅度只剩三成。
+static const int kGaitSpeedMin = 100;     // 官方范围 100~3000，默认 700
 static const int kGaitSpeedMax = 3000;
-static const int kGaitAmountMax = 25;    // 幅度上限（原默认 50，越大越容易失稳）
-static const int kStepCountMax = 3;      // 单次最多走几步，走多了累积漂移容易摔倒
+static const int kGaitAmountMax = 170;    // 官方范围 0~170，默认 30
+static const int kStepCountMax = 100;     // 官方范围 1~100，默认 3
+// 转身特有下限：官方 Turn 默认周期就是 2000ms，这里只兜住"过快"，不再叠加速率倍数
+static const int kTurnSpeedMin = 900;
 
 class OttoController {
 private:
@@ -107,12 +113,12 @@ private:
         if (amount > kGaitAmountMax) return kGaitAmountMax;
         return amount;
     }
-    // 转圈比走路更容易失稳（双脚支撑面一直在切换），
-    // 所以步速在通用钳制之后再放慢 30%，幅度由调用方再减半。
+    // 转身比行走更容易失稳（双脚支撑面一直在切换），所以只设一个较保守的速度下限，
+    // 不再叠加倍数减速——倍数会让模型给的 speed 参数完全失去意义。幅度由调用方减半。
     static int ClampTurnSpeed(int speed) {
-        int v = ClampGaitSpeed(speed) * 13 / 10;
-        if (v > kGaitSpeedMax) v = kGaitSpeedMax;
-        return v;
+        if (speed < kTurnSpeedMin) return kTurnSpeedMin;
+        if (speed > kGaitSpeedMax) return kGaitSpeedMax;
+        return speed;
     }
 
     static int ClampStepCount(int steps) {
