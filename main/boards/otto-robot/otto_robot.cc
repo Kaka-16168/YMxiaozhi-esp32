@@ -802,6 +802,26 @@ private:
     // MCU 与 I2S 麦克风全程不停，所以唤醒词随时可用；
     // 真正省下来的是舵机保持电流（detach 后归零）和屏幕背光功耗。
     // ============================================================
+    // 关机下电任务入口（static：符合 TaskFunction_t 的 C 签名）
+    static void ShutdownPowerDownTask(void* arg) {
+        // 自删 Guard：任何提前 return 的路径都会被析构函数 vTaskDelete(NULL)，不会漏
+        struct Guard {
+            ~Guard() { vTaskDelete(NULL); }
+        } guard;
+
+        OttoRobot* self = static_cast<OttoRobot*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+        // 等关机提示音播完再动舵机，声音不会被舵机电流噪声盖住
+        vTaskDelay(pdMS_TO_TICKS(600));
+        // 下电前再兜一次闹钟：这 600ms 里可能正好轮到下一轮播报，
+        // 若不拦住，会出现"已关机但舵机又抬手招了一下"。
+        self->StopAlarmSequence(false);
+        OttoController_Sleep();      // 内部：清队列 → 逐个 detach → LEDC 保持电流归零
+        ESP_LOGI(TAG, "软关机完成：舵机已下电、屏幕已关，等待语音唤醒");
+    }
+
     void EnterSoftShutdown() {
         ESP_LOGI(TAG, "进入软关机序列");
 
@@ -827,20 +847,11 @@ private:
 
         // 3. 舵机归位 → 逐个下电。这一步在独立任务里做，
         //    因为它要等约 2.5 秒，不能卡住 MCP 调用线程（否则语音回话都播不出来）
-        // 【修复】必须捕获 this：任务体要调用成员函数 StopAlarmSequence()，
-        // 不捕获时 lambda 里没有 this，编译报
-        // "'this' was not captured for this lambda function"
-        xTaskCreate([this](void* arg) {
-            (void)arg;  // 下电走全局 C 接口
-            // 等关机提示音播完再动舵机，声音不会被舵机电流噪声盖住
-            vTaskDelay(pdMS_TO_TICKS(600));
-            // 下电前再兜一次闹钟：600ms 里可能正好轮到下一轮播报，
-            // 若不拦住，会出现"已关机但舵机又抬手招了一下"。
-            StopAlarmSequence(false);
-            OttoController_Sleep();      // 内部：清队列 → 逐个 detach → LEDC 保持电流归零
-            ESP_LOGI(TAG, "软关机完成：舵机已下电、屏幕已关，等待语音唤醒");
-            vTaskDelete(NULL);
-        }, "otto_shutdown", 3072, this, 3, nullptr);
+        // 【修复】不用捕获 lambda：捕获了 this 的 lambda 无法转成 TaskFunction_t
+        // （它要求纯 C 函数指针 void(*)(void*)），会报
+        // "cannot convert ... to TaskFunction_t"。
+        // 改为 static 成员函数当任务入口，this 走 xTaskCreate 的 pvParameters 传进去。
+        xTaskCreate(&OttoRobot::ShutdownPowerDownTask, "otto_shutdown", 3072, this, 3, nullptr);
     }
 
 public:
