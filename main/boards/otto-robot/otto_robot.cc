@@ -77,7 +77,8 @@ private:
 
     // ======== 闹钟相关 ========
     esp_timer_handle_t alarm_timer_ = nullptr;      // 到点定时器（单次）
-    esp_timer_handle_t alarm_tick_timer_ = nullptr; // 播报节拍定时器（周期）
+    esp_timer_handle_t alarm_tick_timer_ = nullptr; // 播报节拍定时器（单次自续）
+    TaskHandle_t alarm_tick_task_ = nullptr;     // 【修复6】当前播报任务，非空表示正在播
     std::string alarm_name_;
     int  alarm_round_ = 0;      // 已播报轮次
     bool alarm_active_ = false; // 闹钟是否处于播报中
@@ -98,6 +99,7 @@ private:
     // 就会解引用半成品对象 → Core panic (LoadProhibited)。
     // 所以回调第一件事就是查这个闸门，构造函数全部做完才置 true。
     bool boot_ready_ = false;
+    bool boot_done_ = false;    // 【修复1】开机归位只做一次的闸门
 
     // OV2640 有两个可能的 PID，抽成小函数避免长条件写错
     static bool pid_is_ov2640(uint16_t pid) {
@@ -395,7 +397,7 @@ private:
         io_config.cs_gpio_num = hw_config_.display_cs_pin;
         io_config.dc_gpio_num = hw_config_.display_dc_pin;
         io_config.spi_mode = DISPLAY_SPI_MODE;
-        io_config.pclk_hz = 20 * 1000 * 1000;
+        io_config.pclk_hz = 10 * 1000 * 1000;
         io_config.trans_queue_depth = 10;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
@@ -493,6 +495,13 @@ private:
 
     // 返回 true 表示全部阶段做完，任务可以退出
     bool BootAdvance() {
+        // 【修复1】终检闸门：归位只许发生一次。
+        // BootFinishTask 若在阶段2 的慢外设初始化里被再次调度，上一轮已跑过归位，
+        // 这一轮又会把 6 个舵机重新拉一遍，叠加在刚上电的舵机上形成二次浪涌——
+        // 这正是日志里 Browmout detector was triggered 的成因之一。
+        if (boot_done_) {
+            return true;
+        }
         // 3 秒兜底：万一网络异常、状态机一直没进 listening，
         // 也不能把音频和舵机饿死，超时强制推进。
         const bool ui_up = boot_phase_ >= kBootUiUp ||
@@ -531,6 +540,7 @@ private:
                 return false;
             }
             boot_phase_ = kBootSettled;
+            boot_done_ = true;      // 【修复1】落闸：后续任何重入都直接返回
             ESP_LOGI(TAG, "开机阶段：画面已稳，舵机开始逐个归位");
             OttoController_BootHomeSequence();
             ESP_LOGI(TAG, "开机舵机逐位归位完成");
@@ -609,11 +619,36 @@ private:
     // 用 tick 定时器驱动状态机，全程不阻塞任何任务，
     // 所以播报期间语音唤醒、按按键、关机都照样能打断。
     // ============================================================
+    // 【修复6】节拍回调只负责"起一个任务"，不自己干活。
+    // 原来回调直接调 AlarmTick()，而 AlarmTick 里有 vTaskDelay(700ms) 和
+    // 一次招手动作（可能持续数秒）。ESP-Timer 是【单个】共享任务，
+    // 回调赖着不走，期间所有 esp_timer 用户全部被堵死——
+    // 闹钟自己续挂的下一轮、其它组件的定时器都排不上队。
+    // 这就是"闹钟只响一声 / 关不掉"的另一个独立成因。
     static void AlarmTickCallback(void* arg) {
+        auto* self = static_cast<OttoRobot*>(arg);
+        if (self == nullptr) {
+            return;
+        }
+        if (self->alarm_tick_task_ != nullptr) {
+            ESP_LOGW(TAG, "上一轮闹钟还没播完，本轮跳过");
+            return;
+        }
+        const BaseType_t rc = xTaskCreate(&OttoRobot::AlarmTickTaskEntry, "otto_alarm_tick",
+                                          3072, self, 3, &self->alarm_tick_task_);
+        if (rc != pdPASS) {
+            ESP_LOGE(TAG, "闹钟播报任务创建失败");
+            self->alarm_tick_task_ = nullptr;
+        }
+    }
+
+    static void AlarmTickTaskEntry(void* arg) {
         auto* self = static_cast<OttoRobot*>(arg);
         if (self != nullptr) {
             self->AlarmTick();
         }
+        self->alarm_tick_task_ = nullptr;   // 自清句柄，允许下一轮
+        vTaskDelete(nullptr);
     }
 
     // 挂下一轮播报。delay_ms=0 表示立刻执行第一轮
@@ -685,6 +720,18 @@ private:
             esp_timer_stop(alarm_tick_timer_);
             esp_timer_delete(alarm_tick_timer_);
             alarm_tick_timer_ = nullptr;
+        }
+        // 【修复2】等正在播报的那一轮真正退出，再往下走。
+        // 标志已经置 false，播报任务会在 700ms 延时后自行结束；这里最多等 1.2 秒。
+        // 不等的话，关机任务紧接着就 DetachServos 下电，而播报任务还在
+        // 队列里塞招手动作 —— 唤醒后这些积压动作会突然一起冒出来。
+        if (alarm_tick_task_ != nullptr) {
+            for (int i = 0; i < 24 && alarm_tick_task_ != nullptr; i++) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (alarm_tick_task_ != nullptr) {
+                ESP_LOGW(TAG, "闹钟播报任务未在 1.2s 内退出（句柄遗留，不强制删除）");
+            }
         }
         if (alarm_timer_ != nullptr) {
             esp_timer_stop(alarm_timer_);
@@ -942,6 +989,7 @@ public:
           has_camera_(false),
           camera_type_(OTTO_CAMERA_NONE),
           alarm_timer_(nullptr),
+          alarm_tick_task_(nullptr),   // 【修复7】补初始化，否则启动期误进 Stop 会删野句柄
           alarm_tick_timer_(nullptr),
           alarm_round_(0),
           alarm_active_(false),
