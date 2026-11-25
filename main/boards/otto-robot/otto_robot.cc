@@ -827,11 +827,14 @@ private:
 
         // 3. 舵机归位 → 逐个下电。这一步在独立任务里做，
         //    因为它要等约 2.5 秒，不能卡住 MCP 调用线程（否则语音回话都播不出来）
-        xTaskCreate([](void* arg) {
-            (void)arg;  // 下电走全局 C 接口，不需要 this
+        // 【修复】必须捕获 this：任务体要调用成员函数 StopAlarmSequence()，
+        // 不捕获时 lambda 里没有 this，编译报
+        // "'this' was not captured for this lambda function"
+        xTaskCreate([this](void* arg) {
+            (void)arg;  // 下电走全局 C 接口
             // 等关机提示音播完再动舵机，声音不会被舵机电流噪声盖住
             vTaskDelay(pdMS_TO_TICKS(600));
-            // 【修复】下电前再兜一次闹钟：600ms 里可能正好轮到下一轮播报，
+            // 下电前再兜一次闹钟：600ms 里可能正好轮到下一轮播报，
             // 若不拦住，会出现"已关机但舵机又抬手招了一下"。
             StopAlarmSequence(false);
             OttoController_Sleep();      // 内部：清队列 → 逐个 detach → LEDC 保持电流归零
