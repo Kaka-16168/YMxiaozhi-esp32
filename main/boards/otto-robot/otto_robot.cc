@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <string>
+#include <cstring>
 
 #include <new>
 
@@ -566,7 +567,7 @@ private:
     void TurnScreenOff() {
         if (display_ != nullptr) {
             display_->SetChatMessage("system", "");
-            display_->SetEmotion("neutral");
+            SafeEmotion("neutral");
         }
         if (GetBacklight() != nullptr) {
             GetBacklight()->SetBrightness(0);
@@ -599,7 +600,7 @@ public:
         // 2. 屏幕先亮，让用户立刻看到反馈
         TurnScreenOn();
         if (display_ != nullptr) {
-            display_->SetEmotion("happy");
+            SafeEmotion("happy");
             display_->SetChatMessage("system", "我在");
         }
 
@@ -690,7 +691,7 @@ private:
         
         const std::string msg = "主人，时间到了";   // 固定话术，与闹钟名无关
         if (display_ != nullptr) {
-            display_->SetEmotion("excited");
+            SafeEmotion("excited");
             display_->SetChatMessage("system", msg.c_str());
         }
         ESP_LOGI(TAG, "闹钟播报: %s", msg.c_str());
@@ -744,7 +745,7 @@ private:
         if (settle && !screen_off_) {
             OttoController_ClearQueue();      // 丢掉还没播完的招手，别攒着一股脑补
             if (display_ != nullptr) {
-                display_->SetEmotion("neutral");
+                SafeEmotion("neutral");
                 display_->SetChatMessage("system", "");
             }
         }
@@ -888,7 +889,7 @@ private:
         }
         if (display_ != nullptr) {
             display_->SetChatMessage("system", "");
-            display_->SetEmotion("neutral");
+            SafeEmotion("neutral");
         }
         ESP_LOGI(TAG, "关机已即时生效：闹钟已停、动作队列已清、屏幕已黑");
 
@@ -1031,11 +1032,15 @@ public:
         InitializeAudioCodec();
         ws_control_server_ = nullptr;
 
+        // 【顺序有讲究】先亮背光，再打提示文字。
+        // 原先是反的：背光还没亮就把文字排进 LVGL，此时 lvgl_display 尚未
+        // 完成 SetupUI()，于是日志报 'SetChatMessage called before SetupUI()'，
+        // 而且这句"启动中..."用户根本看不见——白跑一趟。
+        GetBacklight()->RestoreBrightness();   // ← 背光亮，用户立刻看到画面
         if (display_ != nullptr) {
             display_->SetChatMessage("system", "启动中...");
-            display_->SetEmotion("neutral");
+            SafeEmotion("neutral");
         }
-        GetBacklight()->RestoreBrightness();   // ← 背光亮，用户立刻看到画面
 
         // 到这里所有成员都已构造完毕，才允许按钮回调生效
         boot_ready_ = true;
@@ -1043,6 +1048,22 @@ public:
 
         // 开机尾巴任务：等首帧上屏 → 补摄像头/舵机控制器 → 画面稳了才让舵机归位
         xTaskCreate(BootFinishTask, "otto_boot", 4096, this, 3, nullptr);
+    }
+
+    // ★ 表情安全封装 ★
+    // 角色提示词若让做一个当前表情包里没有的名字（例如 robot_2），
+    // EmojiCollection 会打 "Emoji not found" 并画出空白帧。这里先做一次
+    // 白名单收敛，未知名字一律回退 neutral：既消掉警告，也不留白屏。
+    void SafeEmotion(const char* name) {
+        if (display_ == nullptr || name == nullptr) return;
+        static const char* const kKnown[] = {
+            "neutral", "happy", "excited", "sad", "angry", "surprised", "thinking"
+        };
+        bool ok = false;
+        for (const char* k : kKnown) {
+            if (::strcmp(name, k) == 0) { ok = true; break; }
+        }
+        display_->SetEmotion(ok ? name : "neutral");
     }
 
     virtual AudioCodec* GetAudioCodec() override { return audio_codec_; }
