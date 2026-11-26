@@ -9,8 +9,14 @@
 #include <esp_timer.h>
 #include <sys/time.h>
 #include <time.h>
-#include <string>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 #include <new>
 
@@ -29,8 +35,29 @@
 #include "websocket_control_server.h"
 #include "wifi_board.h"
 #include "assets/lang_config.h"
+#include <wifi_manager.h>
 
 #define TAG "OttoRobot"
+
+// ============================================================
+// 本地提示音（闹钟 / 唤醒用）
+// ------------------------------------------------------------
+// 不用 Lang::Sounds::OGG_WELCOME：那个音效本身就是一句
+// "你好呀，我的朋友"预录欢迎语，而且自定义唤醒词(MultiNet)方案下
+// AFE 未启用、没有回声消除，外放会被麦克风回采成语音输入，
+// 模型随后再补一句客套话。这里换成短提示音，只出声、不说话。
+//
+// OGG_ACTIVATION 由 gen_lang.py 按 locales 里的 activation.ogg 自动生成
+// （zh-CN 缺失时会回退 en-US 同名文件），--language zh-CN 编译即有。
+// 万一你的版本没有这个常量，把它换成 lang_config.h 里任意一个非 WELCOME
+// 的 OGG_ 常量即可；不要注释掉 #define，否则 OTTO_LOCAL_TONE 未定义。
+//
+// ★ 想让喇叭精确「说」出「主人，时间到了」（而不是叮一声）：
+//   用任意 TTS 生成一句中文、存成 alarm.ogg 放进 main/assets/common/，
+//   gen_lang.py 会自动注册成 Lang::Sounds::OGG_ALARM，把下面这行换成它。
+//   播的是本地 OGG，音色由音频文件决定，断网照样念，不经过大模型。
+// ============================================================
+#define OTTO_LOCAL_TONE Lang::Sounds::OGG_ACTIVATION
 
 // ===== 板型识别引脚 =====
 // 官方 README：固件启动时把 GPIO15 / GPIO16 配成输入 + 弱下拉，连续采样稳定为高
@@ -84,6 +111,11 @@ private:
     int  alarm_round_ = 0;      // 已播报轮次
     bool alarm_active_ = false; // 闹钟是否处于播报中
     bool screen_off_ = false;   // 屏幕是否处于软关机黑屏态
+    // 背光是否真的被我们调暗到 0。与 screen_off_ 分开记：框架在语音唤醒时
+    // 可能把 screen_off_ 清掉，但背光亮度不会自己恢复；只认 screen_off_
+    // 就会漏掉"有回应却一直黑屏"。此标志仅由 TurnScreenOn/Off 与关机序列维护。
+    // 用默认成员初始化（不进初始化列表），避免 -Werror=reorder。
+    bool backlight_dimmed_ = false;
 
     // ======== 开机阶段 ========
     // kBootEarly   构造期：只起屏幕，背光亮起就返回，不碰任何慢外设
@@ -480,6 +512,60 @@ private:
     // 所以构造函数只做「不阻塞的事」就返回，音频/摄像头/舵机控制器全部
     // 挪到这里，等 kDeviceStateListening（首帧已上屏）才动手。
     // ============================================================
+    // ============================================================
+    // 【语音唤醒板级反馈】关机后喊「卡卡」屏幕必须跟着亮
+    // ------------------------------------------------------------
+    // 根因：WakeUpFromSoftShutdown() 原先只挂在【按键】回调上。语音唤醒
+    // 走的是框架 Application 的 HandleWakeWordDetectedEvent，板级这条路径
+    // 完全没接上 —— 所以"说关机 → 喊卡卡"时框架进了 listening，但
+    // screen_off_ 仍是 true、背光仍是 0，表现就是"有回应却一直黑屏"。
+    //
+    // 这里用低频轮询兜住：只要状态【刚进入】活跃态（Listening /
+    // Connecting / Speaking），分两种情形：
+    //   ① screen_off_（软关机黑屏）→ 调 WakeUpFromSoftShutdown() 强制亮屏、
+    //      恢复舵机、播本地提示音 —— 本次修复的核心
+    //   ② 已亮屏但无 IP（断网）→ 播本地提示音 + 屏幕写「网络未连接」
+    //
+    // 用 prev != cur 判「刚进入」而不是 prev==Idle：断网时框架会在
+    // Connecting 里反复重连，若只看"非 Idle 就亮"会把黑屏自己点亮。
+    // 唤醒词识别跑在芯片本地不依赖网络，提示音也是本地 OGG，断网同样有反馈；
+    // 但断网下无法对话是服务端架构决定的，这里变不出离线聊天。
+    // ============================================================
+    static void WakeWordFeedbackTask(void* arg) {
+        auto* self = static_cast<OttoRobot*>(arg);
+        if (self == nullptr) { vTaskDelete(nullptr); return; }
+        auto prev = Application::GetInstance().GetDeviceState();
+        int cooldown_ms = 0;
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            cooldown_ms = cooldown_ms > 200 ? cooldown_ms - 200 : 0;
+            auto cur = Application::GetInstance().GetDeviceState();
+            const bool entered_active =
+                (cur == kDeviceStateListening || cur == kDeviceStateConnecting ||
+                 cur == kDeviceStateSpeaking) && (prev != cur);
+            prev = cur;
+            if (!entered_active || cooldown_ms > 0) continue;
+            cooldown_ms = 3000;   // 3 秒冷却，防一次唤醒连续触发多轮
+
+            if (self->screen_off_ || self->backlight_dimmed_) {
+                // ① 软关机黑屏态被语音唤醒：亮屏 + 舵机重新上电 + 本地提示音
+                //    两个标志取或：框架可能已把 screen_off_ 清成 false，
+                //    但 backlight_dimmed_ 仍为 true，只认前者会漏掉黑屏。
+                ESP_LOGI(TAG, "语音唤醒命中（软关机黑屏态）：强制亮屏并恢复舵机");
+                self->WakeUpFromSoftShutdown();
+                continue;
+            }
+            // ② 没关机但网络不通：给一声本地提示音，别让用户以为没醒
+            if (WifiManager::GetInstance().GetIpAddress().empty()) {
+                ESP_LOGW(TAG, "唤醒词已命中，但当前无网络：给本地提示音与屏幕提示");
+                self->PlayLocalTone();
+                if (self->display_ != nullptr) {
+                    self->display_->SetChatMessage("system", "网络未连接");
+                }
+            }
+        }
+    }
+
     static void BootFinishTask(void* arg) {
         auto* self = static_cast<OttoRobot*>(arg);
         const int64_t t0 = esp_timer_get_time();
@@ -562,6 +648,7 @@ private:
             GetBacklight()->RestoreBrightness();
         }
         screen_off_ = false;
+        backlight_dimmed_ = false;
     }
 
     void TurnScreenOff() {
@@ -573,6 +660,7 @@ private:
             GetBacklight()->SetBrightness(0);
         }
         screen_off_ = true;
+        backlight_dimmed_ = true;
     }
 
     // ============================================================
@@ -586,11 +674,12 @@ public:
         // 语音唤醒路径下 screen_off_ 可能已被别处清掉，早退会让亮屏代码一行都不执行，
         // 表现就是"喊了唤醒词、有回应但屏幕一直是黑的"。
         // 现在改为无条件走完亮屏流程，用 force 区分是否已经处于关机态。
-        const bool was_off = screen_off_;
+        const bool was_off = screen_off_ || backlight_dimmed_;
         if (!was_off) {
             ESP_LOGI(TAG, "唤醒：未处于软关机态，仍强制亮屏一次");
         } else {
-            ESP_LOGI(TAG, "从软关机唤醒");
+            ESP_LOGI(TAG, "从软关机唤醒（screen_off=%d, 背光熄灭=%d）",
+                     screen_off_ ? 1 : 0, backlight_dimmed_ ? 1 : 0);
         }
         // 1. 若闹钟正在播报，唤醒视为"知道了"，直接收尾
         if (alarm_active_) {
@@ -607,11 +696,11 @@ public:
         // 3. 舵机重新上电并慢速归位（内部自己做，不阻塞这里）
         OttoController_Wakeup();
 
-        // 4. 【不再播放 OGG_WELCOME】
-        // 那个音效本身就是一句"你好呀，我的朋友"欢迎语；且自定义唤醒词方案下
-        // AFE 未启用、没有回声消除，外放会被麦克风回采，模型随即补一句客套话。
-        // 唤醒已有亮屏 + "我在" + 舵机重新上电归位，反馈足够，不需要出声。
-        ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电（不播欢迎语音）");
+        // 4. 本地提示音（不是 OGG_WELCOME 那句「你好呀，我的朋友」）
+        // 断网时云端不会有任何语音回应，这声本地音效是唯一能告诉用户
+        // "我醒了"的反馈；播的是 Flash 里的短 OGG，不依赖网络。
+        PlayLocalTone();
+        ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电、本地提示音已播");
     }
 
 private:
@@ -662,6 +751,22 @@ private:
         esp_timer_start_once(alarm_tick_timer_, delay_ms * 1000ULL);
     }
 
+    // ============================================================
+    // 【本地提示音】闹钟 / 唤醒 / 离线反馈共用
+    // ------------------------------------------------------------
+    // 走 Application::PlaySound() → AudioService 官方播放队列 → 解码 →
+    // OutputData()。绝不直接 codec->OutputData() 写 I2S：AudioService 的
+    // 播放任务常驻占用同一条 TX 通道，板级直写的 PCM 会被它覆盖或挤掉，
+    // 表现就是"调用了却一点声音都没有"。
+    //
+    // OTTO_LOCAL_TONE 不是 OGG_WELCOME（那是一句预录「你好呀，我的朋友」），
+    // 而是短促的本地提示音；OGG 在 Flash 里，完全离线可用，不经过服务端。
+    // ============================================================
+    void PlayLocalTone() {
+        Application::GetInstance().PlaySound(OTTO_LOCAL_TONE);
+        ESP_LOGI(TAG, "本地提示音已播放（非欢迎语、不经过大模型）");
+    }
+
     void AlarmTick() {
         // 【关键】进回调第一件事就是确认自己还该不该播。
         // 关机 / 唤醒 / 重设闹钟都会把 alarm_active_ 置 false 并删掉定时器，
@@ -684,27 +789,20 @@ private:
             return;
         }
 
-        // ★ 闹钟播报：板子自己把话术固定上屏，全程不碰语音链路 ★
-        // "你好，我的朋友"这句的声源是 Lang::Sounds::OGG_WELCOME —— 它本身就是
-        // 一段预录的欢迎语，并不是代码里写的文字。自定义唤醒词(MultiNet)方案下
-        // AFE 未启用、没有回声消除，这段外放会被麦克风回采成语音输入：
-        //   Application: >> 啊我的朋友  →  Application: << 你好朋友卡卡一直都在呀
-        // 所以用户听到的是"你好我的朋友"，而"主人，时间到了"只出现在屏幕上，
-        // 从来没有真正被念出来过。现在彻底不播这个音效：只上屏 + 招手，
-        // 麦克风没有可回采的声音，模型没有输入，也就不会接话。
-        // 无论闹钟名填什么，屏幕上都只显示这一句。
+        // ★ 闹钟播报：屏幕固定话术 + 喇叭本地提示音 + 温柔招手 ★
+        // 不碰 Lang::Sounds::OGG_WELCOME（那是一段预录的「你好呀，我的朋友」）。
+        // 提示音走官方播放队列，是短促音效、不含欢迎语人声，不会被麦克风
+        // 回采成一句人话让模型接话（旧日志 >> 啊我的朋友 / << 你好朋友卡卡…）。
         const std::string msg = "主人，时间到了";   // 固定话术，与闹钟名无关
         if (display_ != nullptr) {
             SafeEmotion("neutral");                 // 不用 excited：表情包里没这张图
             display_->SetChatMessage("system", msg.c_str());
         }
         ESP_LOGI(TAG, "闹钟播报(屏幕): %s", msg.c_str());
-        // 【新版判据】串口出现这一行 = 烧的是静音版固件，不会再有「你好，我的朋友」
-        ESP_LOGI(TAG, "闹钟静音播报：不播放任何音频，避免麦克风回采触发模型接话");
 
-        // 先让文字上屏，间隔 300ms 再抬手，避免"文字和动作抢同一时刻"
-        vTaskDelay(pdMS_TO_TICKS(300));
-        // 关机可能在延时期间发生，再确认一次，别在关机后还抬手
+        PlayLocalTone();      // 本地 OGG 短提示音，断网也响
+
+        // 关机可能在出声期间发生，再确认一次，别在关机后还抬手
         if (!alarm_active_) {
             return;
         }
@@ -804,7 +902,7 @@ private:
         // 1. 闹钟：到点播报 3 次 + 温柔招手
         mcp_server.AddTool(
             "self.Alarm",
-            "设置一个闹钟。到点后屏幕显示三遍“主人，时间到了”，同时温柔地招手互动（不播语音、不要复述内容）。"
+            "设置一个闹钟。到点后屏幕显示三遍“主人，时间到了”，喇叭播放“叮咚”提示音并温柔地招手互动（不播任何人声、不要复述内容）。"
             "seconde_from_now: 多少秒后响铃；alarm_name: 闹钟的名称或提醒内容",
             PropertyList({
                 Property("seconde_from_now", kPropertyTypeInteger, 10, 0, 86400),
@@ -892,6 +990,7 @@ private:
         //    这期间模型若又下动作指令就会插进来，看起来像"关机没生效"。
         OttoController_ClearQueue();
         screen_off_ = true;                 // 先挡住重复进入与按键穿透
+        backlight_dimmed_ = true;           // 背光确实被调暗，唤醒时必须据此恢复
         if (GetBacklight() != nullptr) {
             GetBacklight()->SetBrightness(0);
         }
@@ -1056,6 +1155,8 @@ public:
 
         // 开机尾巴任务：等首帧上屏 → 补摄像头/舵机控制器 → 画面稳了才让舵机归位
         xTaskCreate(BootFinishTask, "otto_boot", 4096, this, 3, nullptr);
+        // 语音唤醒板级反馈：黑屏态强制亮屏、断网态给本地提示音
+        xTaskCreate(WakeWordFeedbackTask, "otto_wake_fb", 2048, this, 2, nullptr);
     }
 
     // ★ 表情安全封装 ★
