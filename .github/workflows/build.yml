@@ -25,7 +25,7 @@ jobs:
         run: |
           . $IDF_PATH/export.sh  # 关键修复：用 POSIX 的 '.' 替代 'source'
           # 在这里添加了 --wake-word "ka ka" 和 --language zh-CN
-          python scripts/build.py otto-robot  --language zh-CN
+          python scripts/build.py otto-robot  --wake-word "ka ka"   --language zh-CN
 
       - name: Rename merged binary for easy identification
         shell: bash
