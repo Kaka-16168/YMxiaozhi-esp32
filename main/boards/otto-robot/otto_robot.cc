@@ -607,10 +607,11 @@ public:
         // 3. 舵机重新上电并慢速归位（内部自己做，不阻塞这里）
         OttoController_Wakeup();
 
-        // 4. 播一声提示，明确告诉用户已经开机
-        // 唤醒用内置提示音即可（不需要说话，避免又被模型接一句）
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
-        ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电");
+        // 4. 【不再播放 OGG_WELCOME】
+        // 那个音效本身就是一句"你好呀，我的朋友"欢迎语；且自定义唤醒词方案下
+        // AFE 未启用、没有回声消除，外放会被麦克风回采，模型随即补一句客套话。
+        // 唤醒已有亮屏 + "我在" + 舵机重新上电归位，反馈足够，不需要出声。
+        ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电（不播欢迎语音）");
     }
 
 private:
@@ -683,22 +684,26 @@ private:
             return;
         }
 
-        // ★ 闹钟播报：板子自己拼固定话术，不经过大模型 ★
-        // "你好呀，我的朋友"是这么来的：原先靠 MCP 返回值 / 模型自由发挥来报时，
-        // 模型拿到"闹钟到了"就会自己补一句客套话。现在板子直接播固定话术，
-        // 语音链路不唤醒，模型没有插话的机会。
-        // 无论闹钟名填什么，都只播这一句
-        
+        // ★ 闹钟播报：板子自己把话术固定上屏，全程不碰语音链路 ★
+        // "你好，我的朋友"这句的声源是 Lang::Sounds::OGG_WELCOME —— 它本身就是
+        // 一段预录的欢迎语，并不是代码里写的文字。自定义唤醒词(MultiNet)方案下
+        // AFE 未启用、没有回声消除，这段外放会被麦克风回采成语音输入：
+        //   Application: >> 啊我的朋友  →  Application: << 你好朋友卡卡一直都在呀
+        // 所以用户听到的是"你好我的朋友"，而"主人，时间到了"只出现在屏幕上，
+        // 从来没有真正被念出来过。现在彻底不播这个音效：只上屏 + 招手，
+        // 麦克风没有可回采的声音，模型没有输入，也就不会接话。
+        // 无论闹钟名填什么，屏幕上都只显示这一句。
         const std::string msg = "主人，时间到了";   // 固定话术，与闹钟名无关
         if (display_ != nullptr) {
-            SafeEmotion("excited");
+            SafeEmotion("neutral");                 // 不用 excited：表情包里没这张图
             display_->SetChatMessage("system", msg.c_str());
         }
-        ESP_LOGI(TAG, "闹钟播报: %s", msg.c_str());
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_WELCOME);
+        ESP_LOGI(TAG, "闹钟播报(屏幕): %s", msg.c_str());
+        // 【新版判据】串口出现这一行 = 烧的是静音版固件，不会再有「你好，我的朋友」
+        ESP_LOGI(TAG, "闹钟静音播报：不播放任何音频，避免麦克风回采触发模型接话");
 
-        // 先出声，间隔 700ms 再抬手，避免"声音和动作抢同一时刻"显得机械
-        vTaskDelay(pdMS_TO_TICKS(700));
+        // 先让文字上屏，间隔 300ms 再抬手，避免"文字和动作抢同一时刻"
+        vTaskDelay(pdMS_TO_TICKS(300));
         // 关机可能在延时期间发生，再确认一次，别在关机后还抬手
         if (!alarm_active_) {
             return;
@@ -726,12 +731,16 @@ private:
         // 标志已经置 false，播报任务会在 700ms 延时后自行结束；这里最多等 1.2 秒。
         // 不等的话，关机任务紧接着就 DetachServos 下电，而播报任务还在
         // 队列里塞招手动作 —— 唤醒后这些积压动作会突然一起冒出来。
-        if (alarm_tick_task_ != nullptr) {
-            for (int i = 0; i < 24 && alarm_tick_task_ != nullptr; i++) {
+        // 【修复】第 3 轮播完时是【播报任务自己】调进来的，若这里也去等
+        // alarm_tick_task_ 退出，就是"任务等自己"，必然白等 1.2 秒再打一条
+        // "未在 1.2s 内退出"的假警告。只有从别的上下文（关机/唤醒/重设闹钟）
+        // 进来时才需要等它收尾。
+        if (alarm_tick_task_ != nullptr && xTaskGetCurrentTaskHandle() != alarm_tick_task_) {
+            for (int i = 0; i < 60 && alarm_tick_task_ != nullptr; i++) {
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
             if (alarm_tick_task_ != nullptr) {
-                ESP_LOGW(TAG, "闹钟播报任务未在 1.2s 内退出（句柄遗留，不强制删除）");
+                ESP_LOGW(TAG, "闹钟播报任务未在 3s 内退出（句柄遗留，不强制删除）");
             }
         }
         if (alarm_timer_ != nullptr) {
@@ -795,7 +804,7 @@ private:
         // 1. 闹钟：到点播报 3 次 + 温柔招手
         mcp_server.AddTool(
             "self.Alarm",
-            "设置一个闹钟。到点后会用语音连说三遍“主人，时间到了”，同时温柔地招手互动。"
+            "设置一个闹钟。到点后屏幕显示三遍“主人，时间到了”，同时温柔地招手互动（不播语音、不要复述内容）。"
             "seconde_from_now: 多少秒后响铃；alarm_name: 闹钟的名称或提醒内容",
             PropertyList({
                 Property("seconde_from_now", kPropertyTypeInteger, 10, 0, 86400),
@@ -833,14 +842,13 @@ private:
         // 2. 关机：语音回复后舵机归位下电、屏幕关闭，仅保留语音唤醒
         mcp_server.AddTool(
             "self.Shutdown",
-            "关闭机器人。会先用语音说“好的主人，我关机了”，然后舵机逐个归位并彻底断电省电，"
+            "关闭机器人。会立刻关屏、舵机逐个归位并彻底断电省电（不播语音、不要复述内容），"
             "屏幕关闭，只保留语音唤醒，叫一声“卡卡”就能重新开机亮屏。",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
-                // 先把回话播出去，再走关机序列（序列内部会等语音播完再断舵机电）
                 EnterSoftShutdown();
                 // 空返回：不回传任何文本给模型，否则模型会自行复述成
-                // "好的，我的朋友"这类多余的话。关机提示音由 EnterSoftShutdown 内部播放。
+                // "好的，我的朋友"这类多余的话。本机不播任何关机提示音。
                 return ReturnValue("");
             });
     }
@@ -1057,7 +1065,7 @@ public:
     void SafeEmotion(const char* name) {
         if (display_ == nullptr || name == nullptr) return;
         static const char* const kKnown[] = {
-            "neutral", "happy", "excited", "sad", "angry", "surprised", "thinking"
+            "neutral", "happy", "sad", "angry", "surprised", "thinking"
         };
         bool ok = false;
         for (const char* k : kKnown) {
