@@ -40,24 +40,16 @@
 #define TAG "OttoRobot"
 
 // ============================================================
-// 本地提示音（闹钟 / 唤醒用）
+// 【按需求】闹钟 / 唤醒 / 断网反馈全程不播放任何本地音效
 // ------------------------------------------------------------
-// 不用 Lang::Sounds::OGG_WELCOME：那个音效本身就是一句
-// "你好呀，我的朋友"预录欢迎语，而且自定义唤醒词(MultiNet)方案下
-// AFE 未启用、没有回声消除，外放会被麦克风回采成语音输入，
-// 模型随后再补一句客套话。这里换成短提示音，只出声、不说话。
-//
-// OGG_ACTIVATION 由 gen_lang.py 按 locales 里的 activation.ogg 自动生成
-// （zh-CN 缺失时会回退 en-US 同名文件），--language zh-CN 编译即有。
-// 万一你的版本没有这个常量，把它换成 lang_config.h 里任意一个非 WELCOME
-// 的 OGG_ 常量即可；不要注释掉 #define，否则 OTTO_LOCAL_TONE 未定义。
-//
-// ★ 想让喇叭精确「说」出「主人，时间到了」（而不是叮一声）：
-//   用任意 TTS 生成一句中文、存成 alarm.ogg 放进 main/assets/common/，
-//   gen_lang.py 会自动注册成 Lang::Sounds::OGG_ALARM，把下面这行换成它。
-//   播的是本地 OGG，音色由音频文件决定，断网照样念，不经过大模型。
+// 试过两个内置 OGG，都不合适：
+//   OGG_WELCOME    → 一句预录「你好呀，我的朋友」
+//   OGG_ACTIVATION → 配网/登录面板提示「在登录面板添加设备」
+// 两者都是人声，且自定义唤醒词(MultiNet)方案下 AFE 未启用、没有回声消除，
+// 外放会被麦克风回采成语音输入，模型随即接一句无关的话（旧日志里
+// "你是想让我做什么动作吗？" 就是这么来的）。
+// 所以反馈统一收敛为：屏幕文字 + 表情 + 招手 + 亮屏，喇叭保持静音。
 // ============================================================
-#define OTTO_LOCAL_TONE Lang::Sounds::OGG_ACTIVATION
 
 // ===== 板型识别引脚 =====
 // 官方 README：固件启动时把 GPIO15 / GPIO16 配成输入 + 弱下拉，连续采样稳定为高
@@ -430,7 +422,7 @@ private:
         io_config.cs_gpio_num = hw_config_.display_cs_pin;
         io_config.dc_gpio_num = hw_config_.display_dc_pin;
         io_config.spi_mode = DISPLAY_SPI_MODE;
-        io_config.pclk_hz = 40 * 1000 * 1000;
+        io_config.pclk_hz = 20 * 1000 * 1000;
         io_config.trans_queue_depth = 10;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
@@ -522,14 +514,16 @@ private:
     //
     // 这里用低频轮询兜住：只要状态【刚进入】活跃态（Listening /
     // Connecting / Speaking），分两种情形：
-    //   ① screen_off_（软关机黑屏）→ 调 WakeUpFromSoftShutdown() 强制亮屏、
-    //      恢复舵机、播本地提示音 —— 本次修复的核心
-    //   ② 已亮屏但无 IP（断网）→ 播本地提示音 + 屏幕写「网络未连接」
+    //   ① 黑屏态（screen_off_ 或 backlight_dimmed_）→ 调
+    //      WakeUpFromSoftShutdown() 强制亮屏、恢复舵机 —— 本次修复的核心
+    //   ② 已亮屏但无 IP（断网）→ 屏幕写「网络未连接」
     //
+    // 全程不播音效：内置 OGG 是欢迎语 / 配网提示等人声，既不搭场景，
+    // 无 AEC 时还会被麦克风回采让模型接话。反馈全靠屏幕与亮屏。
     // 用 prev != cur 判「刚进入」而不是 prev==Idle：断网时框架会在
     // Connecting 里反复重连，若只看"非 Idle 就亮"会把黑屏自己点亮。
-    // 唤醒词识别跑在芯片本地不依赖网络，提示音也是本地 OGG，断网同样有反馈；
-    // 但断网下无法对话是服务端架构决定的，这里变不出离线聊天。
+    // 唤醒词识别跑在芯片本地不依赖网络；但断网下无法对话是服务端架构
+    // 决定的，这里变不出离线聊天。
     // ============================================================
     static void WakeWordFeedbackTask(void* arg) {
         auto* self = static_cast<OttoRobot*>(arg);
@@ -555,10 +549,9 @@ private:
                 self->WakeUpFromSoftShutdown();
                 continue;
             }
-            // ② 没关机但网络不通：给一声本地提示音，别让用户以为没醒
+            // ② 没关机但网络不通：屏幕写明原因，不播音效（保持静音一致）
             if (WifiManager::GetInstance().GetIpAddress().empty()) {
-                ESP_LOGW(TAG, "唤醒词已命中，但当前无网络：给本地提示音与屏幕提示");
-                self->PlayLocalTone();
+                ESP_LOGW(TAG, "唤醒词已命中，但当前无网络：仅在屏幕提示");
                 if (self->display_ != nullptr) {
                     self->display_->SetChatMessage("system", "网络未连接");
                 }
@@ -696,11 +689,10 @@ public:
         // 3. 舵机重新上电并慢速归位（内部自己做，不阻塞这里）
         OttoController_Wakeup();
 
-        // 4. 本地提示音（不是 OGG_WELCOME 那句「你好呀，我的朋友」）
-        // 断网时云端不会有任何语音回应，这声本地音效是唯一能告诉用户
-        // "我醒了"的反馈；播的是 Flash 里的短 OGG，不依赖网络。
-        PlayLocalTone();
-        ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电、本地提示音已播");
+        // 4. 【静音】不再播放本地音效：内置 OGG 是人声（欢迎语 / 配网提示），
+        //    和唤醒场景不搭，且无 AEC 时会被麦克风回采让模型接话。
+        //    断网时的"我醒了"反馈由亮屏 + "我在" + 舵机归位承担。
+        ESP_LOGI(TAG, "唤醒完成，屏幕已亮、舵机已上电（静音，不播音效）");
     }
 
 private:
@@ -751,22 +743,6 @@ private:
         esp_timer_start_once(alarm_tick_timer_, delay_ms * 1000ULL);
     }
 
-    // ============================================================
-    // 【本地提示音】闹钟 / 唤醒 / 离线反馈共用
-    // ------------------------------------------------------------
-    // 走 Application::PlaySound() → AudioService 官方播放队列 → 解码 →
-    // OutputData()。绝不直接 codec->OutputData() 写 I2S：AudioService 的
-    // 播放任务常驻占用同一条 TX 通道，板级直写的 PCM 会被它覆盖或挤掉，
-    // 表现就是"调用了却一点声音都没有"。
-    //
-    // OTTO_LOCAL_TONE 不是 OGG_WELCOME（那是一句预录「你好呀，我的朋友」），
-    // 而是短促的本地提示音；OGG 在 Flash 里，完全离线可用，不经过服务端。
-    // ============================================================
-    void PlayLocalTone() {
-        Application::GetInstance().PlaySound(OTTO_LOCAL_TONE);
-        ESP_LOGI(TAG, "本地提示音已播放（非欢迎语、不经过大模型）");
-    }
-
     void AlarmTick() {
         // 【关键】进回调第一件事就是确认自己还该不该播。
         // 关机 / 唤醒 / 重设闹钟都会把 alarm_active_ 置 false 并删掉定时器，
@@ -782,27 +758,26 @@ private:
         }
 
         alarm_round_++;
-        ESP_LOGI(TAG, "闹钟第 %d/%d 轮", alarm_round_, kAlarmMaxRounds);
-
+        // 先判超限再打轮次日志：原来会打出难看的「第 4/3 轮」，
+        // 实际那一次只是负责收尾，并不播报。
         if (alarm_round_ > kAlarmMaxRounds) {
+            ESP_LOGI(TAG, "闹钟已播满 %d 轮，收尾", kAlarmMaxRounds);
             StopAlarmSequence(true);
             return;
         }
+        ESP_LOGI(TAG, "闹钟第 %d/%d 轮", alarm_round_, kAlarmMaxRounds);
 
-        // ★ 闹钟播报：屏幕固定话术 + 喇叭本地提示音 + 温柔招手 ★
-        // 不碰 Lang::Sounds::OGG_WELCOME（那是一段预录的「你好呀，我的朋友」）。
-        // 提示音走官方播放队列，是短促音效、不含欢迎语人声，不会被麦克风
-        // 回采成一句人话让模型接话（旧日志 >> 啊我的朋友 / << 你好朋友卡卡…）。
+        // ★ 闹钟播报：屏幕固定话术 + 温柔招手，喇叭全程静音 ★
+        // 不再调用任何 PlaySound：内置 OGG 都是人声（欢迎语 / 配网提示），
+        // 播出来既和"主人，时间到了"不搭，又会被麦克风回采让模型接话。
         const std::string msg = "主人，时间到了";   // 固定话术，与闹钟名无关
         if (display_ != nullptr) {
             SafeEmotion("neutral");                 // 不用 excited：表情包里没这张图
             display_->SetChatMessage("system", msg.c_str());
         }
-        ESP_LOGI(TAG, "闹钟播报(屏幕): %s", msg.c_str());
+        ESP_LOGI(TAG, "闹钟播报(纯屏幕，静音): %s", msg.c_str());
 
-        PlayLocalTone();      // 本地 OGG 短提示音，断网也响
-
-        // 关机可能在出声期间发生，再确认一次，别在关机后还抬手
+        // 关机可能在延时期间发生，再确认一次，别在关机后还抬手
         if (!alarm_active_) {
             return;
         }
